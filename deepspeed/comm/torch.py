@@ -283,7 +283,8 @@ class TorchBackend(Backend):
 
     @disable_compiler_collective
     def reduce_scatter_tensor(self, output_tensor, input_tensor, op=ReduceOp.SUM, group=None, async_op=False):
-        if self.has_reduce_scatter_tensor():
+        # if self.has_reduce_scatter_tensor():
+        if False:  # Fixme: disable for hunyuan-large model on MUSA
             return self.reduce_scatter_function(output_tensor,
                                                 input_tensor,
                                                 op=self._reduce_op(op),

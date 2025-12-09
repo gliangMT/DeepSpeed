@@ -20,7 +20,7 @@ try:
 except ImportError as e:
     dsa2 = None
 
-SUPPORTED_ACCELERATOR_LIST = ['cuda', 'cpu', 'xpu', 'xpu.external', 'npu', 'mps', 'hpu', 'mlu', 'sdaa']
+SUPPORTED_ACCELERATOR_LIST = ['cuda', 'cpu', 'xpu', 'xpu.external', 'npu', 'mps', 'hpu', 'mlu', 'sdaa', 'musa']
 
 ds_accelerator = None
 
@@ -105,6 +105,11 @@ def get_accelerator():
                 import torch_mlu  # noqa: F401
             except ImportError as e:
                 raise ValueError("MLU_Accelerator requires torch_mlu, which is not installed on this system.")
+        elif accelerator_name == "musa":
+            try:
+                import torch_musa
+            except (RuntimeError, ImportError) as e:
+                raise ValueError(f"MUSA_Accelerator requires torch_musa, which is not installed on this system.")
         elif accelerator_name not in SUPPORTED_ACCELERATOR_LIST:
             raise ValueError(f'DS_ACCELERATOR must be one of {SUPPORTED_ACCELERATOR_LIST}. '
                              f'Value "{accelerator_name}" is not supported')
@@ -190,6 +195,13 @@ def get_accelerator():
                 pass
         if accelerator_name is None:
             try:
+                import torch_musa  # noqa: F401,F811
+
+                accelerator_name = "musa"
+            except ImportError as e:
+                pass
+        if accelerator_name is None:
+            try:
                 import torch
 
                 # Determine if we are on a GPU or x86 CPU with torch.
@@ -255,6 +267,10 @@ def get_accelerator():
         from .mlu_accelerator import MLU_Accelerator
 
         ds_accelerator = MLU_Accelerator()
+    elif accelerator_name == 'musa':
+        from .musa_accelerator import MUSA_Accelerator
+
+        ds_accelerator = MUSA_Accelerator()
     _validate_accelerator(ds_accelerator)
     if accel_logger is not None:
         accel_logger.info(f"Setting ds_accelerator to {ds_accelerator._name} ({ds_set_method})")
