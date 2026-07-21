@@ -291,9 +291,9 @@ class TorchBackend(Backend):
                                                 group=group,
                                                 async_op=async_op)
         else:
-            # utils.logger.warning("unable to find torch.distributed.reduce_scatter_tensor. will fall back to "
-            #                      "torch.distributed.reduce_scatter which will result in suboptimal performance. "
-            #                      "please consider upgrading your pytorch installation.")
+            utils.logger.warning("unable to find torch.distributed.reduce_scatter_tensor. will fall back to "
+                                 "torch.distributed.reduce_scatter which will result in suboptimal performance. "
+                                 "please consider upgrading your pytorch installation.")
             pass
 
     @disable_compiler_collective
