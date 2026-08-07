@@ -47,7 +47,11 @@ from deepspeed.moe.ep_experts import GroupedExperts
 from deepspeed.moe.ep_kernels import TokenReorderer
 from deepspeed.moe.ep_repack import repack_expert_weights, repack_fused_expert_weights
 from deepspeed.moe.ep_router import TokenChoiceTopKRouter
-from deepspeed.runtime.engine import DeepSpeedEngine
+from deepspeed.runtime.engine import (
+    DeepSpeedEngine,
+    _rebind_autoep_client_optimizer,
+    _remap_autoep_model_parameters,
+)
 from deepspeed.runtime.zero.stage3 import DeepSpeedZeroOptimizer_Stage3
 from deepspeed.utils import groups
 from unit.v1.moe.autoep_test_utils import (
@@ -334,9 +338,8 @@ class TestAutoEPConfig:
 
     def test_autoep_checkpoint_metadata_supports_backend_parameter_names(self):
         assert autoep_expert_parameter_names({}) == ("w1", "w2", "w3")
-        assert autoep_expert_parameter_names({
-            "expert_parameter_names": ["gate_up_proj", "down_proj"]
-        }) == ("gate_up_proj", "down_proj")
+        assert autoep_expert_parameter_names({"expert_parameter_names":
+                                              ["gate_up_proj", "down_proj"]}) == ("gate_up_proj", "down_proj")
         with pytest.raises(RuntimeError, match="direct parameter names"):
             autoep_expert_parameter_names({"expert_parameter_names": ["nested.weight"]})
 
@@ -1058,6 +1061,74 @@ class TestRoutingAndLayerSemantics:
                            config=AutoEPConfig(enabled=True, autoep_size=1, load_balance_coeff=0.02))
 
 
+class TestAutoEPOptimizerRebind:
+
+    @staticmethod
+    def _make_optimizer_and_plan():
+        model = MockMoETransformer(num_layers=1, num_experts=4, moe_every_n=1)
+        source = model.model.layers[0].mlp
+        old_moe_parameters = list(source.parameters())
+        decay_parameters = [parameter for parameter in model.parameters() if parameter.ndim > 1]
+        no_decay_parameters = [parameter for parameter in model.parameters() if parameter.ndim <= 1]
+        optimizer = torch.optim.AdamW([
+            {
+                "params": decay_parameters,
+                "lr": 3e-4,
+                "weight_decay": 0.1,
+            },
+            {
+                "params": no_decay_parameters,
+                "lr": 2e-4,
+                "weight_decay": 0.0,
+            },
+        ])
+        stale_model_parameters = list(model.parameters())
+        auto_ep = AutoEP(model, _runtime_config(enabled=True, autoep_size=1, preset_model="mixtral"))
+        plan = auto_ep.replace_moe_layers(auto_ep.ep_parser(), ep_size=1, ep_rank=0)
+        return model, optimizer, plan, old_moe_parameters, stale_model_parameters
+
+    def test_rebinds_precreated_optimizer_and_materialized_model_parameters(self):
+        model, optimizer, plan, old_moe_parameters, stale_model_parameters = self._make_optimizer_and_plan()
+        current_parameters = list(model.parameters())
+        original_optimizer = optimizer
+        group_options = [(group["lr"], group["weight_decay"]) for group in optimizer.param_groups]
+
+        remapped_model_parameters = _remap_autoep_model_parameters(
+            stale_model_parameters,
+            plan.parameter_remaps,
+            current_parameters,
+        )
+        _rebind_autoep_client_optimizer(optimizer, plan.parameter_remaps, current_parameters)
+
+        current_ids = {id(parameter) for parameter in current_parameters if parameter.requires_grad}
+        optimizer_ids = [id(parameter) for group in optimizer.param_groups for parameter in group["params"]]
+        assert optimizer is original_optimizer
+        assert len(optimizer_ids) == len(set(optimizer_ids))
+        assert set(optimizer_ids) == current_ids
+        assert {id(parameter) for parameter in remapped_model_parameters} == current_ids
+        assert not ({id(parameter) for parameter in old_moe_parameters} & current_ids)
+        assert not ({id(parameter) for parameter in old_moe_parameters} & set(optimizer_ids))
+        assert [(group["lr"], group["weight_decay"]) for group in optimizer.param_groups] == group_options
+
+        autoep_layer = model.model.layers[0].mlp
+        decay_ids = {id(parameter) for parameter in optimizer.param_groups[0]["params"]}
+        assert id(autoep_layer.router.gate.weight) in decay_ids
+        assert {id(parameter) for parameter in autoep_layer.experts.parameters()} <= decay_ids
+
+    def test_rebind_rejects_existing_optimizer_state_atomically(self):
+        model, optimizer, plan, old_moe_parameters, _ = self._make_optimizer_and_plan()
+        source = old_moe_parameters[0]
+        optimizer.state[source]["step"] = torch.tensor(1.0)
+        original_group_ids = [[id(parameter) for parameter in group["params"]] for group in optimizer.param_groups]
+
+        with pytest.raises(RuntimeError, match="after state exists"):
+            _rebind_autoep_client_optimizer(optimizer, plan.parameter_remaps, list(model.parameters()))
+
+        assert [[id(parameter) for parameter in group["params"]]
+                for group in optimizer.param_groups] == original_group_ids
+        assert optimizer.state[source]["step"].item() == 1.0
+
+
 class TestModelDetectionAndReplacement:
 
     def test_mixtral_detect_replace_and_mock_forward(self):
@@ -1149,9 +1220,7 @@ class TestModelDetectionAndReplacement:
                                   source_moe,
                                   ep_size=2,
                                   ep_rank=1,
-                                  config=AutoEPConfig(enabled=True,
-                                                      autoep_size=2,
-                                                      expert_backend="musa_te"))
+                                  config=AutoEPConfig(enabled=True, autoep_size=2, expert_backend="musa_te"))
 
         assert set(dict(replaced.experts.named_parameters(recurse=False))) == {"gate_up_proj", "down_proj"}
         torch.testing.assert_close(replaced.experts.gate_up_proj, source_moe.experts.gate_up_proj[2:4])
@@ -1175,9 +1244,8 @@ class TestModelDetectionAndReplacement:
 
         def grouped_weight_grad(input, grad_output, split_sizes, weight):
             return torch.stack([
-                expert_grad.transpose(0, 1) @ expert_input
-                for expert_input, expert_grad in zip(torch.split(input, split_sizes),
-                                                     torch.split(grad_output, split_sizes))
+                expert_grad.transpose(0, 1) @ expert_input for expert_input, expert_grad in zip(
+                    torch.split(input, split_sizes), torch.split(grad_output, split_sizes))
             ])
 
         monkeypatch.setattr(ep_experts_musa, "_validate_grouped_linear_inputs", lambda *args: None)

@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 import re
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Literal
 
 import torch
@@ -33,6 +34,7 @@ from deepspeed.module_inject.auto_ep_presets.registry import (
     unsupported_preset_for_hf_model_type,
 )
 from deepspeed.moe.fused_expert_layout import classify_fused_gate_up_layout
+from deepspeed.moe.ep_repack import _get_expert_weight
 from deepspeed.runtime.zero.utils import is_zero_param
 from deepspeed.utils import logger
 
@@ -270,6 +272,142 @@ def _detect_forward_contract(
     )
 
 
+@dataclass(frozen=True)
+class AutoEPParamRemap:
+    """One optimizer-group-preserving parameter replacement relation."""
+
+    role: str
+    sources: tuple[nn.Parameter, ...]
+    targets: tuple[nn.Parameter, ...]
+
+
+@dataclass(frozen=True)
+class AutoEPReplacementPlan:
+    """Parameter identity changes produced while replacing MoE layers."""
+
+    parameter_remaps: tuple[AutoEPParamRemap, ...]
+    replaced_layer_count: int
+
+
+def _parameter_tuple(*parameters) -> tuple[nn.Parameter, ...]:
+    return tuple(parameter for parameter in parameters if isinstance(parameter, nn.Parameter))
+
+
+def _expert_source_parameter_sets(
+    experts_source: nn.Module,
+    spec: MoELayerSpec,
+    weight_name: str | None,
+    ep_rank: int,
+    ep_size: int,
+) -> tuple[tuple[nn.Parameter, ...], tuple[nn.Parameter, ...]]:
+    if weight_name is None:
+        return (), ()
+    if spec.expert_storage == "fused_3d":
+        return _parameter_tuple(getattr(experts_source, weight_name)), ()
+    if spec.expert_storage == "module_list":
+        num_local_experts = spec.num_experts // ep_size
+        expert_start = ep_rank * num_local_experts
+        expert_end = expert_start + num_local_experts
+        local_parameters = []
+        removed_parameters = []
+        for expert_index, expert in enumerate(experts_source):
+            parameter = _get_expert_weight(expert, weight_name)
+            if not isinstance(parameter, nn.Parameter):
+                continue
+            if expert_start <= expert_index < expert_end:
+                local_parameters.append(parameter)
+            else:
+                removed_parameters.append(parameter)
+        return tuple(local_parameters), tuple(removed_parameters)
+    raise ValueError(f"Unknown expert_storage type: {spec.expert_storage}")
+
+
+def _build_autoep_parameter_remaps(source_module: nn.Module, replacement: nn.Module, spec: MoELayerSpec, ep_rank: int,
+                                   ep_size: int) -> tuple[AutoEPParamRemap, ...]:
+    source_gate = getattr(source_module, spec.router_name)
+    source_experts = getattr(source_module, spec.experts_name)
+    remaps = [
+        AutoEPParamRemap(
+            role=f"{spec.moe_module_name}.router.weight",
+            sources=_parameter_tuple(source_gate.weight),
+            targets=_parameter_tuple(replacement.router.gate.weight),
+        )
+    ]
+
+    source_gate_bias = getattr(source_gate, "bias", None)
+    target_gate_bias = getattr(replacement.router.gate, "bias", None)
+    if isinstance(source_gate_bias, nn.Parameter) or isinstance(target_gate_bias, nn.Parameter):
+        remaps.append(
+            AutoEPParamRemap(
+                role=f"{spec.moe_module_name}.router.bias",
+                sources=_parameter_tuple(source_gate_bias),
+                targets=_parameter_tuple(target_gate_bias),
+            ))
+
+    source_ecb = getattr(source_gate, "e_score_correction_bias", None)
+    target_ecb = getattr(replacement.router, "e_score_correction_bias", None)
+    if isinstance(source_ecb, nn.Parameter) or isinstance(target_ecb, nn.Parameter):
+        remaps.append(
+            AutoEPParamRemap(
+                role=f"{spec.moe_module_name}.router.e_score_correction_bias",
+                sources=_parameter_tuple(source_ecb),
+                targets=_parameter_tuple(target_ecb),
+            ))
+
+    source_w1, removed_w1 = _expert_source_parameter_sets(source_experts, spec, spec.expert_w1_name, ep_rank, ep_size)
+    source_w2, removed_w2 = _expert_source_parameter_sets(source_experts, spec, spec.expert_w2_name, ep_rank, ep_size)
+    source_w3, removed_w3 = _expert_source_parameter_sets(source_experts, spec, spec.expert_w3_name, ep_rank, ep_size)
+    if hasattr(replacement.experts, "gate_up_proj"):
+        expert_relations = (
+            ("experts.gate_up_proj", source_w1, _parameter_tuple(replacement.experts.gate_up_proj)),
+            ("experts.down_proj", source_w2, _parameter_tuple(replacement.experts.down_proj)),
+        )
+    else:
+        w1_targets = _parameter_tuple(replacement.experts.w1)
+        if spec.expert_w3_name is None:
+            w1_targets += _parameter_tuple(replacement.experts.w3)
+        expert_relations = [
+            ("experts.w1", source_w1, w1_targets),
+            ("experts.w2", source_w2, _parameter_tuple(replacement.experts.w2)),
+        ]
+        if spec.expert_w3_name is not None:
+            expert_relations.append(("experts.w3", source_w3, _parameter_tuple(replacement.experts.w3)))
+
+    for role, sources, targets in expert_relations:
+        remaps.append(AutoEPParamRemap(
+            role=f"{spec.moe_module_name}.{role}",
+            sources=sources,
+            targets=targets,
+        ))
+
+    for role, removed_sources in (("experts.w1.remote", removed_w1), ("experts.w2.remote", removed_w2),
+                                  ("experts.w3.remote", removed_w3)):
+        for source_index, removed_source in enumerate(removed_sources):
+            remaps.append(
+                AutoEPParamRemap(
+                    role=f"{spec.moe_module_name}.{role}.{source_index}",
+                    sources=(removed_source, ),
+                    targets=(),
+                ))
+
+    source_roles = {}
+    target_roles = {}
+    for remap in remaps:
+        if not remap.sources:
+            raise RuntimeError(f"AutoEP parameter remap '{remap.role}' has an empty source set.")
+        for source in remap.sources:
+            previous = source_roles.setdefault(id(source), remap.role)
+            if previous != remap.role:
+                raise RuntimeError(f"AutoEP source parameter is shared by incompatible remaps '{previous}' and "
+                                   f"'{remap.role}'.")
+        for target in remap.targets:
+            previous = target_roles.setdefault(id(target), remap.role)
+            if previous != remap.role:
+                raise RuntimeError(f"AutoEP target parameter is shared by incompatible remaps '{previous}' and "
+                                   f"'{remap.role}'.")
+    return tuple(remaps)
+
+
 class AutoEP:
     """Automatic Expert Parallelism: detect and replace MoE layers."""
 
@@ -492,7 +630,7 @@ class AutoEP:
         spec: MoELayerSpec,
         ep_size: int,
         ep_rank: int,
-    ) -> nn.Module:
+    ) -> tuple[nn.Module, tuple[AutoEPParamRemap, ...]]:
         from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer
 
         # Navigate to the parent module and get the child name
@@ -511,10 +649,11 @@ class AutoEP:
             ep_rank=ep_rank,
             config=self.config,
         )
+        parameter_remaps = _build_autoep_parameter_remaps(source_module, replacement, spec, ep_rank, ep_size)
 
         # Replace in-place on parent
         setattr(parent, child_name, replacement)
-        return replacement
+        return replacement, parameter_remaps
 
     def _retarget_transformers_output_recorders(self, spec: MoELayerSpec, replacement: nn.Module) -> None:
         adapter = get_preset_adapter(spec.preset_adapter)
@@ -531,26 +670,29 @@ class AutoEP:
         spec: MoELayerSpec,
         ep_size: int,
         ep_rank: int,
-    ) -> None:
+    ) -> AutoEPReplacementPlan:
         """Replace a single MoE module with AutoEPMoELayer in-place on the model."""
-        replacement = self._replace_moe_layer_without_retarget(spec, ep_size, ep_rank)
+        replacement, parameter_remaps = self._replace_moe_layer_without_retarget(spec, ep_size, ep_rank)
         self._retarget_transformers_output_recorders(spec, replacement)
 
         logger.info(f"AutoEP: replaced '{spec.moe_module_name}' with AutoEPMoELayer "
                     f"(ep_size={ep_size}, ep_rank={ep_rank}, "
                     f"local_experts={replacement.num_local_experts})")
+        return AutoEPReplacementPlan(parameter_remaps=parameter_remaps, replaced_layer_count=1)
 
     def replace_moe_layers(
         self,
         specs: list[MoELayerSpec],
         ep_size: int,
         ep_rank: int,
-    ) -> None:
+    ) -> AutoEPReplacementPlan:
         """Replace multiple MoE modules and batch post-replacement recorder retargeting."""
         replacements: list[tuple[MoELayerSpec, nn.Module]] = []
+        parameter_remaps: list[AutoEPParamRemap] = []
         for spec in specs:
-            replacement = self._replace_moe_layer_without_retarget(spec, ep_size, ep_rank)
+            replacement, layer_parameter_remaps = self._replace_moe_layer_without_retarget(spec, ep_size, ep_rank)
             replacements.append((spec, replacement))
+            parameter_remaps.extend(layer_parameter_remaps)
             logger.info(f"AutoEP: replaced '{spec.moe_module_name}' with AutoEPMoELayer "
                         f"(ep_size={ep_size}, ep_rank={ep_rank}, "
                         f"local_experts={replacement.num_local_experts})")
@@ -562,6 +704,8 @@ class AutoEP:
 
         for spec, replacement in retarget_groups.values():
             self._retarget_transformers_output_recorders(spec, replacement)
+
+        return AutoEPReplacementPlan(parameter_remaps=tuple(parameter_remaps), replaced_layer_count=len(replacements))
 
     def _apply_config_overrides(self, preset: MoEModelPreset) -> MoEModelPreset:
         return apply_config_overrides(self.config, preset)

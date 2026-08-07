@@ -158,6 +158,129 @@ DeepSpeedOptimizerCallable = \
     Callable[[Union[Iterable[Parameter], Dict[str, Iterable]]], Optimizer]
 DeepSpeedSchedulerCallable = Callable[[Optimizer], _LRScheduler]
 
+
+def _remap_autoep_parameter_groups(parameter_groups, parameter_remaps, current_parameters, context):
+    """Return remapped parameter lists without mutating the caller's groups."""
+    current_parameter_ids = {id(parameter) for parameter in current_parameters}
+    parameter_locations = defaultdict(list)
+    for group_index, parameters in enumerate(parameter_groups):
+        for parameter in parameters:
+            parameter_locations[id(parameter)].append(group_index)
+
+    active_remaps = {}
+    source_to_remap = {}
+    target_to_remap = {}
+    for remap_index, remap in enumerate(parameter_remaps):
+        for source in remap.sources:
+            previous = source_to_remap.setdefault(id(source), remap_index)
+            if previous != remap_index:
+                raise RuntimeError(f"AutoEP source parameter belongs to multiple remaps while updating {context}.")
+        for target in remap.targets:
+            previous = target_to_remap.setdefault(id(target), remap_index)
+            if previous != remap_index:
+                raise RuntimeError(f"AutoEP target parameter belongs to multiple remaps while updating {context}.")
+
+        source_locations = [parameter_locations.get(id(source), []) for source in remap.sources]
+        present_source_count = sum(bool(locations) for locations in source_locations)
+        if present_source_count == 0:
+            continue
+        if present_source_count != len(remap.sources):
+            raise RuntimeError(f"AutoEP parameter remap '{remap.role}' is only partially present in {context}.")
+        if any(len(locations) != 1 for locations in source_locations):
+            raise RuntimeError(f"AutoEP parameter remap '{remap.role}' contains a duplicated source in {context}.")
+
+        source_group_indices = {locations[0] for locations in source_locations}
+        if len(source_group_indices) != 1:
+            raise RuntimeError(f"AutoEP parameter remap '{remap.role}' spans multiple groups in {context}.")
+        if any(parameter_locations.get(id(target)) for target in remap.targets):
+            raise RuntimeError(f"AutoEP parameter remap '{remap.role}' has both source and target parameters in "
+                               f"{context}.")
+        if any(id(target) not in current_parameter_ids for target in remap.targets):
+            raise RuntimeError(f"AutoEP parameter remap '{remap.role}' targets a parameter outside the current model.")
+        active_remaps[remap_index] = next(iter(source_group_indices))
+
+    remapped_groups = []
+    emitted_remaps = set()
+    emitted_parameter_ids = set()
+    for group_index, parameters in enumerate(parameter_groups):
+        remapped_parameters = []
+        for parameter in parameters:
+            remap_index = source_to_remap.get(id(parameter))
+            if remap_index is not None:
+                if active_remaps.get(remap_index) != group_index or remap_index in emitted_remaps:
+                    continue
+                for target in parameter_remaps[remap_index].targets:
+                    if id(target) in emitted_parameter_ids:
+                        raise RuntimeError(f"AutoEP produced a duplicated target parameter while updating {context}.")
+                    remapped_parameters.append(target)
+                    emitted_parameter_ids.add(id(target))
+                emitted_remaps.add(remap_index)
+                continue
+
+            if id(parameter) not in current_parameter_ids:
+                raise RuntimeError(f"AutoEP found an unmapped stale parameter while updating {context}.")
+            if id(parameter) in emitted_parameter_ids:
+                raise RuntimeError(f"AutoEP found a duplicated current parameter while updating {context}.")
+            remapped_parameters.append(parameter)
+            emitted_parameter_ids.add(id(parameter))
+        remapped_groups.append(remapped_parameters)
+
+    if emitted_remaps != set(active_remaps):
+        raise RuntimeError(f"AutoEP did not emit every active parameter remap while updating {context}.")
+    return remapped_groups
+
+
+def _remap_autoep_model_parameters(model_parameters, parameter_remaps, current_parameters):
+    """Refresh an eagerly materialized model-parameter list after AutoEP replacement."""
+    if not parameter_remaps:
+        return model_parameters
+    if model_parameters and any(isinstance(group, dict) for group in model_parameters):
+        if not all(isinstance(group, dict) and "params" in group for group in model_parameters):
+            raise RuntimeError("AutoEP requires model_parameters to be either parameters or parameter-group dicts.")
+        parameter_groups = [list(group["params"]) for group in model_parameters]
+        remapped_groups = _remap_autoep_parameter_groups(parameter_groups, parameter_remaps, current_parameters,
+                                                         "model_parameters")
+        result = []
+        for group, remapped_parameters in zip(model_parameters, remapped_groups):
+            remapped_group = dict(group)
+            remapped_group["params"] = remapped_parameters
+            result.append(remapped_group)
+        return result
+
+    remapped_groups = _remap_autoep_parameter_groups([list(model_parameters)], parameter_remaps, current_parameters,
+                                                     "model_parameters")
+    return remapped_groups[0]
+
+
+def _rebind_autoep_client_optimizer(optimizer, parameter_remaps, current_parameters):
+    """Rebind a newly created client optimizer to AutoEP replacement parameters."""
+    parameter_groups = [list(group["params"]) for group in optimizer.param_groups]
+    optimizer_parameter_ids = {id(parameter) for parameters in parameter_groups for parameter in parameters}
+
+    for remap in parameter_remaps:
+        present_sources = [source for source in remap.sources if id(source) in optimizer_parameter_ids]
+        if not present_sources:
+            continue
+        for source in present_sources:
+            if source.grad is not None:
+                raise RuntimeError(f"AutoEP cannot replace optimizer parameter '{remap.role}' after gradients exist.")
+            if source in optimizer.state and optimizer.state[source]:
+                raise RuntimeError(f"AutoEP cannot replace optimizer parameter '{remap.role}' after state exists.")
+            if getattr(source, "_backward_hooks", None) or getattr(source, "_post_accumulate_grad_hooks", None):
+                raise RuntimeError(f"AutoEP cannot replace optimizer parameter '{remap.role}' after parameter hooks "
+                                   "are registered.")
+
+    remapped_groups = _remap_autoep_parameter_groups(parameter_groups, parameter_remaps, current_parameters,
+                                                     "client optimizer")
+    for group, remapped_parameters in zip(optimizer.param_groups, remapped_groups):
+        group["params"] = remapped_parameters
+    for remap in parameter_remaps:
+        for source in remap.sources:
+            if source in optimizer.state:
+                del optimizer.state[source]
+    return optimizer
+
+
 try:
     import apex
     from apex import amp
@@ -309,7 +432,7 @@ class DeepSpeedEngine(Module):
         self._do_sanity_check()
         if self.log_level() is not None:
             set_log_level_from_string(self.log_level())
-        self._configure_expert_parallel(model)
+        autoep_replacement_plan = self._configure_expert_parallel(model)
         if self.autotp_size() > 1:
             self._configure_tensor_parallel(model, self.tensor_parallel_config())
         see_memory_usage("DeepSpeed Engine: After args sanity test", force=self.memory_breakdown())
@@ -378,6 +501,19 @@ class DeepSpeedEngine(Module):
         # Convert model parameters from generator to list
         if not isinstance(model_parameters, list):
             model_parameters = list(model_parameters)
+        if autoep_replacement_plan is not None and autoep_replacement_plan.parameter_remaps:
+            current_model_parameters = list(self.module.parameters())
+            model_parameters = _remap_autoep_model_parameters(
+                model_parameters,
+                autoep_replacement_plan.parameter_remaps,
+                current_model_parameters,
+            )
+            if isinstance(optimizer, Optimizer):
+                _rebind_autoep_client_optimizer(
+                    optimizer,
+                    autoep_replacement_plan.parameter_remaps,
+                    current_model_parameters,
+                )
 
         # grad scaler only for Z0 (no ZeRO) + fp16 + torch_autocast
         # ZeRO1/2/3 optimizers have their own grad scaler logic
@@ -537,7 +673,7 @@ class DeepSpeedEngine(Module):
         """Initialize AutoEP: detect MoE layers, create EP groups, replace with EP-enabled layers."""
         autoep_config = self._config.expert_parallel_config
         if autoep_config is None or not autoep_config.enabled:
-            return
+            return None
 
         from deepspeed.module_inject.auto_ep import AutoEP
         from deepspeed.module_inject.auto_ep_config import validate_autoep_config, validate_autoep_post_detection
@@ -605,12 +741,14 @@ class DeepSpeedEngine(Module):
 
         if specs:
             validate_autoep_post_detection(autoep_config, specs)
-            auto_ep.replace_moe_layers(specs, ep_size=ep_size, ep_rank=ep_rank)
+            replacement_plan = auto_ep.replace_moe_layers(specs, ep_size=ep_size, ep_rank=ep_rank)
             logger.info(f"AutoEP: replaced {len(specs)} MoE layer(s) with ep_size={ep_size}")
 
             # Re-tag optimizer flags for newly created AutoEP parameters
             from deepspeed import set_optimizer_flags
             set_optimizer_flags(self._config, model)
+            return replacement_plan
+        return None
 
     def _autoep_sequence_parallel_world_size(self):
         if self.mpu is not None and hasattr(self.mpu, 'get_sequence_parallel_world_size'):
@@ -3912,9 +4050,7 @@ class DeepSpeedEngine(Module):
                     module_prefix = f"{n_module}." if n_module else ""
 
                     # Collect per-expert tensors to stack for the selected backend.
-                    expert_parameter_names = [
-                        name for name, _ in module.experts.named_parameters(recurse=False)
-                    ]
+                    expert_parameter_names = [name for name, _ in module.experts.named_parameters(recurse=False)]
                     stacked = {name: [] for name in expert_parameter_names}
 
                     for local_expert_id in range(num_local_experts):
@@ -4993,7 +5129,8 @@ class DeepSpeedEngine(Module):
                                                      UNIVERSAL_CHECKPOINT_VERSION_VALUE)
                 parameter_names = {
                     name
-                    for entry in autoep_layer_info for name in autoep_expert_parameter_names(entry)
+                    for entry in autoep_layer_info
+                    for name in autoep_expert_parameter_names(entry)
                 }
                 universal_checkpoint_info[EXPERT_PARAMETER_PATTERNS] = [
                     rf'.*\.experts\.{re.escape(name)}$' for name in sorted(parameter_names)

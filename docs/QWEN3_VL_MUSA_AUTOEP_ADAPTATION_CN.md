@@ -15,6 +15,7 @@ Qwen3-VL-MoE 在 MUSA 设备上使用 DeepSpeed AutoEP，以及为什么这项�
 - 模型从 Hugging Face MoE 层转换为 AutoEP 层的完整过程；
 - MUSA Transformer Engine（TE）GroupedGEMM 后端的前向和反向数据流；
 - MUSA 2.7.x 的稳定 top-k 和专家计数正确性修复；
+- AutoEP 替换 Parameter 后如何重绑定已提前创建的 client optimizer；
 - AutoEP、ZeRO-3 和 MCCL 多进程组通信为什么可能卡住，以及保守串行模式如何工作；
 - ZeRO-3 checkpoint 为什么要记录后端相关的专家参数名；
 - 推荐配置、验证方法、已知限制和排障步骤。
@@ -190,6 +191,35 @@ MUSA TE 后端的直接参数名是 `gate_up_proj/down_proj`。如果 checkpoint
 因此 checkpoint 元数据新增了每层真实的 `expert_parameter_names`，同时对旧 checkpoint
 保留 `w1/w2/w3` 兼容路径。
 
+### 2.6 AutoEP 替换层后必须同步更新 optimizer 参数对象
+
+LLaMAFactory 等上层框架可能在调用 `deepspeed.initialize()` 之前就创建 client optimizer。
+optimizer 的 `param_groups` 此时保存的是原始 Hugging Face Router 和专家 `Parameter` 对象。
+AutoEP 随后会创建新的 `AutoEPMoELayer`，并为 Router 和本地专家创建新的 `Parameter` 对象；
+复制权重数值不会保留 Python 对象身份。
+
+如果只替换模型而不更新 optimizer，ZeRO-3 会从旧 `param_groups` 建立分片和梯度 hook：
+
+```text
+forward/backward 使用新的 AutoEP 参数
+    !=
+optimizer/ZeRO-3 持有的旧 MoE 参数
+```
+
+这种错误不会必然 OOM 或 hang。训练甚至会异常快，但新的 Router/专家参数不会进入 optimizer 更新，
+global grad norm 也会主要反映非专家参数，最终表现为 loss 或收敛速度偏离。
+
+当前修复让 AutoEP 在替换时返回精确的参数映射计划，并在创建 ZeRO optimizer 之前：
+
+1. 按本地 expert slice 建立旧参数到新参数的映射；
+2. 从 `model_parameters` 和 client optimizer 中移除非本 EP rank 的远端专家；
+3. 将本地源 Router/专家替换为新的 AutoEP `Parameter`；
+4. 保留原 optimizer 对象、param-group 顺序、学习率和 weight decay 等组属性；
+5. 校验 optimizer 参数集合与当前模型 trainable 参数集合一致。
+
+映射禁止按名称或 shape 猜测。遇到部分源参数、跨 param-group 合并、重复参数、未映射旧参数，
+或源参数已经拥有 optimizer state、梯度和 backward hook 时会在 ZeRO 初始化前直接报错，避免静默少训参数。
+
 ## 3. 从初始化到一次训练 step 的完整流程
 
 ### 3.1 初始化流程
@@ -206,6 +236,9 @@ MUSA TE 后端的直接参数名是 `gate_up_proj/down_proj`。如果 checkpoint
     -> 每个 EP rank 切出自己的 16 个专家
     -> 创建 AutoEPMoELayer + MusaTEGroupedExperts
     -> 复制 Router 和本地专家权重
+    -> 生成原 Parameter 到新 Parameter 的精确映射计划
+    -> 重绑定 model_parameters 和已提前创建的 client optimizer
+    -> 校验 param-group 语义和当前模型参数身份
     -> 标记专家参数的并行归属
     -> 进入 ZeRO-3 optimizer 初始化
 ```
@@ -553,7 +586,7 @@ checkpoint 代码不再硬编码参数名，而是读取每层的真实 direct p
 | `deepspeed/module_inject/auto_ep_presets/qwen3_vl_moe.py` | 新增 Qwen3-VL 文本 MoE preset |
 | `deepspeed/module_inject/auto_ep_presets/registry.py` | 注册新 preset 和 adapter |
 | `deepspeed/module_inject/auto_ep_presets/base.py` | 增加 backend/通信配置和嵌套 config 解析接口 |
-| `deepspeed/module_inject/auto_ep.py` | 对每个 preset 使用 adapter 解析后的模型 config |
+| `deepspeed/module_inject/auto_ep.py` | 解析模型 config，并生成 AutoEP 参数替换映射计划 |
 | `deepspeed/module_inject/auto_ep_config.py` | 解析并校验 `expert_backend`、`serialize_communications` |
 | `deepspeed/module_inject/auto_ep_layer.py` | 接入 MUSA TE experts 和串行 All-to-All |
 | `deepspeed/moe/ep_experts_musa.py` | MUSA TE GroupedGEMM forward/backward 和 SwiGLU |
@@ -564,7 +597,7 @@ checkpoint 代码不再硬编码参数名，而是读取每层的真实 direct p
 | `deepspeed/comm/comm.py` | 将 DeepSpeed communication facade 纳入 sequencer |
 | `deepspeed/runtime/zero/partitioned_param_coordinator.py` | 按 process group 拆分并排序 ZeRO AllGather |
 | `deepspeed/runtime/zero/stage3.py` | 将 ZeRO 梯度归约纳入通信串行边界 |
-| `deepspeed/runtime/engine.py` | 后端无关的专家参数保存/加载和 metadata |
+| `deepspeed/runtime/engine.py` | 在 ZeRO 初始化前重绑定 model parameters/client optimizer，并处理专家保存加载 |
 | `deepspeed/checkpoint/autoep_zero3_metadata.py` | 校验真实专家参数名并兼容旧格式 |
 | `deepspeed/checkpoint/autoep_universal.py` | Universal Checkpoint 支持后端参数名 |
 | `deepspeed/checkpoint/ds_to_universal.py` | 转换时动态生成专家参数 pattern |
@@ -634,45 +667,55 @@ PY
 - MUSA TE 融合参数布局、零 token 和 dispatch padding；
 - stable top-k 和 MUSA 2.7.x 版本门；
 - `ep_count` host fallback 版本门；
+- 已提前创建的 client optimizer/model-parameter list 在 AutoEP 替换后正确重绑定；
+- optimizer 组属性保留，以及已有 state 时原子失败；
 - 通信 sequencer 的嵌套、event 和 Work.wait；
 - ZeRO-3 process group、梯度归约、checkpoint metadata 和 Universal conversion。
 
-目标测试通过。完整 AutoEP 单测文件目前为 75 个通过、1 个失败；失败项是既有的 CPU Mixtral
-router-logit capture 对比，与本次 MUSA stable top-k/count 路径无关。提交前仍应在网络可用环境
-执行修改文件的 pre-commit。
+此前完整 AutoEP 单测文件为 75 个通过、1 个失败；失败项是既有的 CPU Mixtral router-logit
+capture 对比，与本次 MUSA stable top-k/count 路径无关。本次修复另外增加 client optimizer
+重绑定的单元和分布式集成测试，并要求修改文件通过 pre-commit。
 
-### 11.2 GA=8 短训对比
+### 11.2 client optimizer 修复后的 GA=8 短训对比
 
-相同数据顺序下的前两步：
+EXP83 使用预先创建的 MUSA FusedAdamW、AutoEP size 8、micro-batch 1 和 GA=8。相同数据顺序下，
+与最接近的非 AutoEP 历史基线 EXP78 对比如下：
 
-| 实验 | step1 loss | step2 loss | 说明 |
-| --- | ---: | ---: | --- |
-| 非 AutoEP EXP77/78 | 约 1.020 | 1.026--1.027 | 历史参考 |
-| 修复前 AutoEP EXP80 | 1.023 | 1.030 | 存在错误 count 风险 |
-| 修复后 AutoEP EXP81 | 1.020851 | 1.027 | loss 回到历史参考附近 |
+| step | 非 AutoEP loss/grad norm | AutoEP loss/grad norm |
+| ---: | ---: | ---: |
+| 1 | 1.020 / 13.88 | 1.020 / 13.82 |
+| 2 | 1.026 / 13.50 | 1.026 / 13.28 |
+| 3 | 1.009 / 13.69 | 1.012 / 13.64 |
+| 4 | 1.024 / 13.69 | 1.024 / 13.77 |
+| 5 | 1.016 / 13.56 | 1.017 / 13.75 |
+| 6 | 1.006 / 13.50 | 1.007 / 13.20 |
 
-EXP81 首步约 237.93 秒，第二步增量约 180.1 秒。首步包含冷启动，不能用于稳态性能结论。
+六步 loss 最大绝对差为 0.003，平均值相差约 0.08%；grad norm 最大相对差约 2.22%。
+这与修复前 AutoEP 约 11.7--12.1 的偏低 grad norm 不同，说明 Router 和专家参数已经重新进入
+optimizer/ZeRO-3 更新路径。该结果是短训正确性证据，仍不能替代完整收敛验证。
 
-### 11.3 仍未关闭的数值问题
+排除首步编译后，EXP83 step2--6 平均约 237.6 秒，EXP78 对应历史区间约 265.8 秒，短测提升约
+10.6%。动态样本长度会影响 step time，因此正式性能结论仍应使用更长时间的配对统计。
 
-EXP81 前两步 global grad norm 为 12.04/11.69，低于非 AutoEP 历史参考的约
-13.88/13.44--13.50。loss 对齐不能证明所有梯度都等价。
+### 11.3 optimizer 参数身份验收
 
-后续需要单独审计：
+使用已创建 client optimizer 的 AutoEP 初始化必须满足：
 
-- expert 参数是否只在正确 EDP group 归约；
-- global grad norm 是否同时覆盖普通参数和专家参数；
-- EP/EDP reduction 的除数是否与全局 DP 语义一致；
-- 日志中的 grad norm 是真实更新前全局范数，还是分组/分片局部口径。
+```text
+set(id(p) for current trainable model parameters)
+    ==
+set(id(p) for optimizer param_groups)
+```
 
-在该差异解释清楚前，应把当前状态描述为“路由两项已修复、短训 loss 对齐”，而不是“完整精度
-等价已经证明”。
+同时不能存在重复参数或仍指向原 Hugging Face MoE 层的 stale 参数。分布式集成测试覆盖了
+optimizer 对象和组属性保留；单元测试覆盖正常重绑定及源参数已有 state 时不修改任何 param-group
+的原子失败行为。
 
-### 11.4 显存风险
+### 11.4 显存状态
 
-EXP81 的一次全 rank 采样中，最坏设备约为 79,587 MiB / 81,920 MiB，只剩约 2.3 GiB。
-MoE 的 token 分布和动态序列会造成 rank 间显存不均衡，因此平均显存充足并不能代表所有 rank
-安全。正式长训应持续记录 32 卡物理显存峰值和 allocator peak。
+EXP83 的一次全 32 卡物理显存采样范围约为 42,530--47,620 MiB / 81,920 MiB，最坏卡仍有约
+34.3 GiB 空间。该数据是实时采样而非完整峰值；MoE token 分布和动态序列仍会造成 rank 间差异，
+正式长训应继续记录所有 rank 的物理显存峰值和 allocator peak。
 
 ## 12. 常见问题排查
 
@@ -696,6 +739,8 @@ MoE 的 token 分布和动态序列会造成 rank 间显存不均衡，因此平
 - expert counts 的总和是否等于 `T * top_k`；
 - 是否使用了错误的原生 MUSA `bincount`；
 - Router 的 score function、归一化、scale 和 top-k 是否与原模型一致；
+- client optimizer 是否在 AutoEP 替换前创建，以及其 param-group 是否已重绑定到新参数；
+- optimizer 参数身份集合是否与当前模型全部 trainable 参数严格相等；
 - 数据顺序、seed、GA、micro-batch 和 checkpointing 是否完全一致；
 - 是否只比较了局部 grad norm。
 
@@ -785,8 +830,8 @@ stable top-k 和可信 `ep_count` 是 MUSA/torch 2.7.x 的正确性保护，不�
 
 按正确性和风险优先级排序：
 
-1. 解释并修复 AutoEP 与非 AutoEP 的 global grad norm 口径差异；
-2. 在长序列和更多 step 下验证所有 rank 显存，处理最坏 rank 仅剩约 2.3 GiB 的风险；
+1. 用更长的 GA=8 训练确认 AutoEP 与非 AutoEP 的收敛轨迹；
+2. 在长序列和更多 step 下持续验证所有 rank 显存峰值；
 3. 为 MUSA 提供经过生产 shape 验证的 device-side expert count，消除 host bincount 同步；
 4. 推动 TE/MATE 接受 device `m_splits`/offsets，减少 counts 的 D2H 同步；
 5. 在 MCCL 多进程组顺序和 stream 语义明确后，分阶段恢复安全通信重叠；
@@ -803,6 +848,7 @@ stable top-k 和可信 `ep_count` 是 MUSA/torch 2.7.x 的正确性保护，不�
 - [ ] `autoep_size` 整除专家数；
 - [ ] 每个 EP rank 只持有期望的 16 个专家；
 - [ ] MUSA TE forward、dX、dW 都真正执行；
+- [ ] client optimizer/model_parameters 已重绑定，且参数身份集合与当前模型一致；
 - [ ] stable top-k tie case 结果固定；
 - [ ] expert count 总和严格等于 assignment 数；
 - [ ] zero-token expert 和动态 shape 数值正确；
