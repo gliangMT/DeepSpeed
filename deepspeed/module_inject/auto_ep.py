@@ -289,6 +289,7 @@ class AutoEP:
 
         for preset_name, preset in presets_to_try:
             adapter = get_preset_adapter(preset.preset_adapter)
+            model_config = adapter.resolve_model_config(self.model_config)
             pattern = re.compile(preset.moe_layer_pattern)
 
             for module_name, module in self.model.named_modules():
@@ -335,9 +336,9 @@ class AutoEP:
                 num_experts = None
                 top_k = None
 
-                if self.model_config is not None:
-                    num_experts = _get_num_experts_from_config(self.model_config, preset)
-                    top_k = _get_top_k_from_config(self.model_config, preset)
+                if model_config is not None:
+                    num_experts = _get_num_experts_from_config(model_config, preset)
+                    top_k = _get_top_k_from_config(model_config, preset)
 
                 # Validate/derive from router weight shape
                 router_weight = getattr(router_child, 'weight', None)
@@ -389,7 +390,7 @@ class AutoEP:
                     score_func = self.config.score_func
                 else:
                     # Check model config for scoring_func attribute
-                    cfg_score = getattr(self.model_config, 'scoring_func', None)
+                    cfg_score = getattr(model_config, 'scoring_func', None)
                     if cfg_score in ("softmax", "sigmoid"):
                         score_func = cfg_score
                     else:
@@ -401,11 +402,11 @@ class AutoEP:
                 else:
                     score_apply = preset.score_apply
 
-                route_norm = adapter.resolve_route_norm(self.config, preset, self.model_config)
+                route_norm = adapter.resolve_route_norm(self.config, preset, model_config)
 
-                route_scale = _resolve_route_scale(self.config, self.model_config)
+                route_scale = _resolve_route_scale(self.config, model_config)
 
-                group_routing = adapter.resolve_group_routing(self.config, self.model_config)
+                group_routing = adapter.resolve_group_routing(self.config, model_config)
 
                 # Check gate bias
                 gate_bias = preset.gate_bias
@@ -429,12 +430,12 @@ class AutoEP:
                                 shared_gate_name = preset.shared_experts_gate_pattern
 
                 # Warn about router stochasticity/precision settings
-                if self.model_config is not None:
-                    jitter = getattr(self.model_config, 'router_jitter_noise', 0.0)
+                if model_config is not None:
+                    jitter = getattr(model_config, 'router_jitter_noise', 0.0)
                     if jitter and jitter > 0:
                         logger.warning(f"Layer {module_name}: model has router_jitter_noise={jitter}, "
                                        f"AutoEP router does not implement jitter.")
-                    z_loss = getattr(self.model_config, 'router_z_loss_coef', 0.0)
+                    z_loss = getattr(model_config, 'router_z_loss_coef', 0.0)
                     if z_loss and z_loss > 0:
                         logger.warning(f"Layer {module_name}: model has router_z_loss_coef={z_loss}, "
                                        f"AutoEP router does not implement z-loss.")

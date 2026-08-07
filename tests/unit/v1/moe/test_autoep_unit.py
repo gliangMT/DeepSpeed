@@ -15,7 +15,12 @@ import torch.nn as nn
 
 import deepspeed.runtime.engine as ds_engine
 import deepspeed.runtime.zero.stage3 as zero_stage3
+import deepspeed.moe.ep_count as ep_count
+import deepspeed.moe.ep_router as ep_router
 import deepspeed.moe.ep_repack as ep_repack
+import deepspeed.moe.ep_experts_musa as ep_experts_musa
+import deepspeed.runtime.comm.autoep_serialization as autoep_serialization
+from deepspeed.checkpoint.autoep_zero3_metadata import autoep_expert_parameter_names
 from deepspeed.module_inject.auto_ep import AutoEP, _resolve_route_scale
 from deepspeed.module_inject.auto_ep_config import (
     AutoEPConfig,
@@ -40,7 +45,7 @@ from deepspeed.module_inject.auto_ep_presets.registry import (
 from deepspeed.moe.layer import MoE
 from deepspeed.moe.ep_experts import GroupedExperts
 from deepspeed.moe.ep_kernels import TokenReorderer
-from deepspeed.moe.ep_repack import repack_expert_weights
+from deepspeed.moe.ep_repack import repack_expert_weights, repack_fused_expert_weights
 from deepspeed.moe.ep_router import TokenChoiceTopKRouter
 from deepspeed.runtime.engine import DeepSpeedEngine
 from deepspeed.runtime.zero.stage3 import DeepSpeedZeroOptimizer_Stage3
@@ -210,6 +215,8 @@ class TestAutoEPConfig:
             "load_balance_coeff": None,
             "score_apply": "pre",
             "route_scale": 2.0,
+            "expert_backend": "musa_te",
+            "serialize_communications": True,
             "validate_folding_routing": True,
         })
 
@@ -218,10 +225,120 @@ class TestAutoEPConfig:
         assert config.preset_model == "mixtral"
         assert config.validate_folding_routing is True
         assert config.load_balance_coeff is None
+        assert config.expert_backend == "musa_te"
+        assert config.serialize_communications is True
         assert config._load_balance_coeff_explicit is True
         assert config.score_apply == "pre"
         assert config.route_scale == 2.0
         validate_autoep_config(config, world_size=4, pp_size=1, tp_size=1, sp_size=1)
+
+    def test_invalid_expert_backend_rejected(self):
+        config = AutoEPConfig(enabled=True, autoep_size=1, expert_backend="unknown")
+        with pytest.raises(ValueError, match="expert_backend"):
+            validate_autoep_config(config, world_size=1, pp_size=1, tp_size=1, sp_size=1)
+
+    def test_serialize_communications_requires_boolean(self):
+        config = AutoEPConfig(enabled=True, serialize_communications="true")
+        with pytest.raises(ValueError, match="serialize_communications"):
+            validate_autoep_config(config, world_size=1, pp_size=1, tp_size=1, sp_size=1)
+
+    def test_communication_sequencer_completes_each_collective(self, monkeypatch):
+        calls = []
+
+        class FakeEvent:
+
+            def record(self):
+                calls.append("record")
+
+            def synchronize(self):
+                calls.append("wait")
+
+        class FakeAccelerator:
+
+            @staticmethod
+            def is_synchronized_device():
+                return False
+
+            @staticmethod
+            def Event():
+                return FakeEvent()
+
+        autoep_serialization.reset_autoep_communication_serialization_for_testing()
+        monkeypatch.setattr(autoep_serialization, "get_accelerator", lambda: FakeAccelerator())
+        autoep_serialization.enable_autoep_communication_serialization()
+        try:
+            with autoep_serialization.serialized_autoep_communication("first"):
+                calls.append("launch_first")
+            assert calls == ["launch_first", "record", "wait"]
+
+            with autoep_serialization.serialized_autoep_communication("second"):
+                calls.append("launch_second")
+            assert calls == ["launch_first", "record", "wait", "launch_second", "record", "wait"]
+        finally:
+            autoep_serialization.reset_autoep_communication_serialization_for_testing()
+
+    def test_communication_sequencer_treats_nested_scope_as_one_collective(self, monkeypatch):
+        calls = []
+
+        class FakeEvent:
+
+            def record(self):
+                calls.append("record")
+
+            def synchronize(self):
+                calls.append("wait")
+
+        class FakeAccelerator:
+
+            @staticmethod
+            def is_synchronized_device():
+                return False
+
+            @staticmethod
+            def Event():
+                return FakeEvent()
+
+        autoep_serialization.reset_autoep_communication_serialization_for_testing()
+        monkeypatch.setattr(autoep_serialization, "get_accelerator", lambda: FakeAccelerator())
+        autoep_serialization.enable_autoep_communication_serialization()
+        try:
+            with autoep_serialization.serialized_autoep_communication("outer"):
+                calls.append("outer")
+                with autoep_serialization.serialized_autoep_communication("inner"):
+                    calls.append("inner")
+
+            assert calls == ["outer", "inner", "record", "wait"]
+        finally:
+            autoep_serialization.reset_autoep_communication_serialization_for_testing()
+
+    def test_communication_sequencer_waits_backend_work(self):
+        calls = []
+
+        class FakeWork:
+
+            def wait(self):
+                calls.append("work_wait")
+
+        autoep_serialization.reset_autoep_communication_serialization_for_testing()
+        try:
+            work = FakeWork()
+            autoep_serialization.complete_autoep_communication(work)
+            assert calls == []
+
+            autoep_serialization.enable_autoep_communication_serialization()
+            autoep_serialization.complete_autoep_communication(work)
+            autoep_serialization.complete_autoep_communication([None, work])
+            assert calls == ["work_wait", "work_wait"]
+        finally:
+            autoep_serialization.reset_autoep_communication_serialization_for_testing()
+
+    def test_autoep_checkpoint_metadata_supports_backend_parameter_names(self):
+        assert autoep_expert_parameter_names({}) == ("w1", "w2", "w3")
+        assert autoep_expert_parameter_names({
+            "expert_parameter_names": ["gate_up_proj", "down_proj"]
+        }) == ("gate_up_proj", "down_proj")
+        with pytest.raises(RuntimeError, match="direct parameter names"):
+            autoep_expert_parameter_names({"expert_parameter_names": ["nested.weight"]})
 
     def test_validate_folding_routing_requires_boolean(self):
         with pytest.raises(ValueError, match="validate_folding_routing"):
@@ -663,6 +780,15 @@ class TestAutoEPConfig:
         with pytest.raises(NotImplementedError, match="ds_to_universal.py"):
             engine._raise_if_autoep_zero3_consolidated_export("save_16bit_model")
 
+    def test_autoep_zero3_disabled_16bit_export_is_a_safe_noop(self, tmp_path):
+        engine = object.__new__(DeepSpeedEngine)
+        engine.zero_optimization_partition_weights = lambda: True
+        engine.zero_gather_16bit_weights_on_model_save = lambda: False
+        engine._raise_if_autoep_zero3_consolidated_export = lambda operation: pytest.fail(
+            f"unexpected AutoEP export guard for disabled operation {operation}")
+
+        assert engine.save_16bit_model(str(tmp_path)) is False
+
     def test_universal_converter_detects_zero3_partitioned_autoep_model_state(self, tmp_path):
         from deepspeed.checkpoint.constants import (
             AUTOEP_LAYERS_KEY,
@@ -787,9 +913,17 @@ class TestAutoEPConfig:
             parse_model_states([str(model_file)])
 
     def test_preset_registry_core_contracts(self):
-        assert set(PRESET_MODELS) == {"mixtral", "qwen3_moe", "qwen3_5_moe", "deepseek_v2", "deepseek_v3"}
+        assert set(PRESET_MODELS) == {
+            "mixtral",
+            "qwen3_moe",
+            "qwen3_5_moe",
+            "qwen3_vl_moe",
+            "deepseek_v2",
+            "deepseek_v3",
+        }
         assert preset_name_for_hf_model_type("mixtral") == "mixtral"
         assert preset_name_for_hf_model_type("qwen2_moe") == "qwen3_moe"
+        assert preset_name_for_hf_model_type("qwen3_vl_moe") == "qwen3_vl_moe"
         assert preset_name_for_hf_model_type("llama4_text") is None
 
         qwen35 = unsupported_preset_for_hf_model_type("qwen3_5_moe")
@@ -828,6 +962,36 @@ class TestAutoEPConfig:
 
 
 class TestRoutingAndLayerSemantics:
+
+    def test_router_topk_ties_are_stable_on_affected_musa(self, monkeypatch):
+        monkeypatch.setattr(ep_router, "_requires_stable_topk", lambda _: True)
+        router = TokenChoiceTopKRouter(8, 4, None, None, 2, "softmax", True, 1.0, False)
+        with torch.no_grad():
+            router.gate.weight.zero_()
+
+        _, selected_experts, counts = router(torch.randn(6, 8))
+
+        expected_experts = torch.tensor([[0, 1]]).expand(6, -1)
+        assert torch.equal(selected_experts, expected_experts)
+        assert torch.equal(counts, torch.tensor([6.0, 6.0, 0.0, 0.0]))
+
+    def test_musa_torch_27_routes_bincount_through_host(self, monkeypatch):
+        fake_indices = SimpleNamespace(device=SimpleNamespace(type="musa"))
+        monkeypatch.setattr(torch, "__version__", "2.7.1+git")
+
+        assert ep_count._requires_host_bincount(fake_indices)
+        assert ep_router._requires_stable_topk(fake_indices)
+
+    def test_non_musa_or_newer_musa_keeps_device_bincount(self, monkeypatch):
+        musa_indices = SimpleNamespace(device=SimpleNamespace(type="musa"))
+        cpu_indices = SimpleNamespace(device=SimpleNamespace(type="cpu"))
+
+        monkeypatch.setattr(torch, "__version__", "2.9.1")
+        assert not ep_count._requires_host_bincount(musa_indices)
+        assert not ep_router._requires_stable_topk(musa_indices)
+        monkeypatch.setattr(torch, "__version__", "2.7.1")
+        assert not ep_count._requires_host_bincount(cpu_indices)
+        assert not ep_router._requires_stable_topk(cpu_indices)
 
     def test_router_route_scale_and_group_limited_routing(self):
         base = TokenChoiceTopKRouter(64, 8, 4, 2, 2, "softmax", False, 1.0, False)
@@ -963,6 +1127,77 @@ class TestModelDetectionAndReplacement:
         ]
         assert all(call["modifier_rank"] is None for call in FakeGatheredParameters.calls)
 
+    def test_musa_te_repack_preserves_fused_gate_up_layout(self):
+        source = MockMoETransformer(num_layers=1, num_experts=4, moe_every_n=1)
+        source_moe = source.model.layers[0].mlp
+        spec = AutoEP(source, _runtime_config(enabled=True, autoep_size=2, preset_model="mixtral")).ep_parser()[0]
+
+        gate_up, down = repack_fused_expert_weights(source_moe.experts, spec, ep_rank=1, ep_size=2)
+
+        torch.testing.assert_close(gate_up, source_moe.experts.gate_up_proj[2:4])
+        torch.testing.assert_close(down, source_moe.experts.down_proj[2:4])
+        assert gate_up.shape == (2, 256, 64)
+        assert down.shape == (2, 64, 128)
+
+    def test_musa_te_backend_keeps_fused_expert_parameters(self, monkeypatch):
+        monkeypatch.setattr(ep_experts_musa, "is_musa_te_grouped_gemm_available", lambda: True)
+        source = MockMoETransformer(num_layers=1, num_experts=4, moe_every_n=1)
+        source_moe = source.model.layers[0].mlp
+        spec = AutoEP(source, _runtime_config(enabled=True, autoep_size=2, preset_model="mixtral")).ep_parser()[0]
+
+        replaced = AutoEPMoELayer(spec,
+                                  source_moe,
+                                  ep_size=2,
+                                  ep_rank=1,
+                                  config=AutoEPConfig(enabled=True,
+                                                      autoep_size=2,
+                                                      expert_backend="musa_te"))
+
+        assert set(dict(replaced.experts.named_parameters(recurse=False))) == {"gate_up_proj", "down_proj"}
+        torch.testing.assert_close(replaced.experts.gate_up_proj, source_moe.experts.gate_up_proj[2:4])
+        torch.testing.assert_close(replaced.experts.down_proj, source_moe.experts.down_proj[2:4])
+        assert replaced.experts.gate_up_proj.ds_zero_placement_family == "autoep_expert"
+        assert replaced.experts.down_proj.ds_zero_placement_family == "autoep_expert"
+
+    def test_musa_te_grouped_linear_zero_pads_dispatch_buffer(self, monkeypatch):
+
+        def grouped_forward(input, weight, split_sizes):
+            return torch.cat([
+                expert_input @ expert_weight.transpose(0, 1)
+                for expert_input, expert_weight in zip(torch.split(input, split_sizes), weight)
+            ])
+
+        def grouped_input_grad(grad_output, weight, split_sizes):
+            return torch.cat([
+                expert_grad @ expert_weight
+                for expert_grad, expert_weight in zip(torch.split(grad_output, split_sizes), weight)
+            ])
+
+        def grouped_weight_grad(input, grad_output, split_sizes, weight):
+            return torch.stack([
+                expert_grad.transpose(0, 1) @ expert_input
+                for expert_input, expert_grad in zip(torch.split(input, split_sizes),
+                                                     torch.split(grad_output, split_sizes))
+            ])
+
+        monkeypatch.setattr(ep_experts_musa, "_validate_grouped_linear_inputs", lambda *args: None)
+        monkeypatch.setattr(ep_experts_musa, "_te_grouped_forward", grouped_forward)
+        monkeypatch.setattr(ep_experts_musa, "_te_grouped_input_grad", grouped_input_grad)
+        monkeypatch.setattr(ep_experts_musa, "_te_grouped_weight_grad", grouped_weight_grad)
+
+        input = torch.randn(6, 4, requires_grad=True)
+        weight = torch.randn(2, 3, 4, requires_grad=True)
+        counts = torch.tensor([2, 1])
+        output = ep_experts_musa.musa_te_grouped_linear(input, weight, counts)
+
+        expected_active = grouped_forward(input[:3], weight, [2, 1])
+        torch.testing.assert_close(output[:3], expected_active)
+        torch.testing.assert_close(output[3:], torch.zeros_like(output[3:]))
+
+        output.sum().backward()
+        torch.testing.assert_close(input.grad[3:], torch.zeros_like(input.grad[3:]))
+        assert weight.grad is not None
+
     def test_module_list_replacement_preserves_frozen_experts_and_trainable_router(self, monkeypatch):
         monkeypatch.setattr(get_preset_adapter("deepseek_v3"), "_installed_transformers_version", lambda: "5.0.0")
         model = MockDeepSeekV3Transformer(num_layers=1, num_experts=4).to(dtype=torch.bfloat16)
@@ -1093,6 +1328,36 @@ class TestModelDetectionAndReplacement:
         model.config.model_type = "qwen3_5_moe"
         with pytest.raises(ValueError, match="qwen3_5_moe_text"):
             AutoEP(model, _runtime_config(enabled=True, autoep_size=1))._resolve_presets()
+
+    def test_qwen3_vl_preset_detects_only_text_backbone_moe_layers(self):
+        model = nn.Module()
+        model.config = SimpleNamespace(
+            model_type="qwen3_vl_moe",
+            text_config=SimpleNamespace(
+                model_type="qwen3_vl_moe_text",
+                num_experts=4,
+                num_experts_per_tok=2,
+                hidden_size=64,
+                moe_intermediate_size=128,
+                norm_topk_prob=True,
+            ),
+        )
+        model.model = nn.Module()
+        model.model.language_model = nn.Module()
+        model.model.language_model.layers = nn.ModuleList([])
+        for _ in range(2):
+            layer = nn.Module()
+            layer.mlp = MockMoEBlock(num_experts=4, ffn_hidden=128, hidden_size=64)
+            model.model.language_model.layers.append(layer)
+
+        specs = AutoEP(model, _runtime_config(enabled=True, autoep_size=1)).ep_parser()
+
+        assert len(specs) == 2
+        assert all(spec.model_family == "qwen3_vl_moe" for spec in specs)
+        assert all(spec.moe_module_name.startswith("model.language_model.layers.") for spec in specs)
+        assert all(spec.has_shared_experts is False for spec in specs)
+        assert all(spec.expert_w1_name == "gate_up_proj" for spec in specs)
+        assert all(spec.expert_w2_name == "down_proj" for spec in specs)
 
     def test_deepseek_v3_detection_and_score_correction_bias_copy(self, monkeypatch):
         FakeGatheredParameters.calls = []

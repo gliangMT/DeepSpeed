@@ -53,6 +53,8 @@ def parse_autoep_config(param_dict: dict) -> AutoEPConfig:
     config.expert_pattern = param_dict.get("expert_pattern", None)
     config.router_pattern = param_dict.get("router_pattern", None)
     config.use_grouped_mm = param_dict.get("use_grouped_mm", True)
+    config.expert_backend = param_dict.get("expert_backend", "auto")
+    config.serialize_communications = param_dict.get("serialize_communications", False)
     config.route_norm = param_dict.get("route_norm", None)
     config.route_scale = param_dict.get("route_scale", 1.0)
     config.score_apply = param_dict.get("score_apply", "auto")
@@ -114,8 +116,15 @@ def validate_autoep_config(
     if not isinstance(config.validate_folding_routing, bool):
         raise ValueError("expert_parallel.validate_folding_routing must be a boolean")
 
+    if not isinstance(config.serialize_communications, bool):
+        raise ValueError("expert_parallel.serialize_communications must be a boolean")
+
     if not config.enabled:
         return
+
+    valid_expert_backends = ("auto", "musa_te")
+    if config.expert_backend not in valid_expert_backends:
+        raise ValueError(f"expert_backend must be one of {valid_expert_backends}, got '{config.expert_backend}'")
 
     folding_spec = build_folding_spec(
         world_size=world_size,

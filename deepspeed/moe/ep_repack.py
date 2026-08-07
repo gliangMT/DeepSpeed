@@ -94,6 +94,50 @@ def repack_expert_requires_grad_flags(
         raise ValueError(f"Unknown expert_storage type: {spec.expert_storage}")
 
 
+def repack_fused_expert_weights(
+    experts_source: nn.Module,
+    spec: MoELayerSpec,
+    ep_rank: int,
+    ep_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return local fused gate-up and down weights in TE-compatible layout."""
+    if spec.expert_storage != "fused_3d" or spec.expert_w3_name is not None:
+        raise ValueError("The fused expert backend requires fused_3d gate-up expert storage.")
+
+    num_local_experts = spec.num_experts // ep_size
+    expert_start = ep_rank * num_local_experts
+    expert_end = expert_start + num_local_experts
+    gate_up_full = getattr(experts_source, spec.expert_w1_name)
+    down_full = getattr(experts_source, spec.expert_w2_name)
+
+    with _gather_source_zero_params([gate_up_full, down_full]):
+        gate_up = _source_data(gate_up_full)[expert_start:expert_end].clone()
+        down = _source_data(down_full)[expert_start:expert_end].clone()
+        layout = classify_fused_gate_up_layout(tuple(gate_up.shape), tuple(down.shape))
+        if layout is None:
+            raise ValueError("Unsupported fused expert weight layout for the MUSA TE backend: "
+                             f"{spec.expert_w1_name}={tuple(gate_up.shape)}, "
+                             f"{spec.expert_w2_name}={tuple(down.shape)}")
+        if layout.layout != "gate_up_first":
+            gate_up = gate_up.transpose(1, 2)
+            down = down.transpose(1, 2)
+
+    return gate_up.contiguous(), down.contiguous()
+
+
+def repack_fused_expert_requires_grad_flags(
+    experts_source: nn.Module,
+    spec: MoELayerSpec,
+) -> tuple[bool, bool]:
+    """Return requires-grad flags for fused gate-up and down parameters."""
+    if spec.expert_storage != "fused_3d" or spec.expert_w3_name is not None:
+        raise ValueError("The fused expert backend requires fused_3d gate-up expert storage.")
+    return (
+        _requires_grad(getattr(experts_source, spec.expert_w1_name)),
+        _requires_grad(getattr(experts_source, spec.expert_w2_name)),
+    )
+
+
 def _repack_fused_3d(
     experts_source: nn.Module,
     spec: MoELayerSpec,

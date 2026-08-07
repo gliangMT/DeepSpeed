@@ -20,6 +20,7 @@ from deepspeed.utils.debug import debug_param2name_id_shape
 from deepspeed.accelerator import get_accelerator
 import deepspeed.runtime.compiler as compiler
 from deepspeed.runtime.compiler import is_compiling
+from deepspeed.runtime.comm.autoep_serialization import serialized_autoep_communication
 
 import logging
 
@@ -603,14 +604,33 @@ class PartitionedParameterCoordinator:
             ]:
                 if not param_group:
                     continue
-                with get_accelerator().stream(self.__allgather_stream):
-                    event_name = __class__.FORWARD_ALL_GATHER if forward else __class__.BACKWARD_ALL_GATHER
-                    self.__profiler.start_event(event_name)
-                    handle = param_group[0].all_gather_coalesced(param_group, quantize=quantize)
-                    self.__profiler.stop_event(event_name, all_gather_numel)
+                params_by_process_group = {}
                 for param in param_group:
-                    assert param.ds_status == ZeroParamStatus.INFLIGHT, param.ds_summary()
-                    self.__inflight_param_registry[param] = handle
+                    process_group = getattr(param, "ds_process_group", None)
+                    params_by_process_group.setdefault(id(process_group), []).append(param)
+
+                # Every rank participates in the replicated/global group, while each
+                # EP rank belongs to a different EDP group.  Submit the common group
+                # first and keep the order deterministic before entering subgroup
+                # collectives.
+                ordered_param_groups = sorted(
+                    params_by_process_group.values(),
+                    key=lambda params: (
+                        any(getattr(param, "ds_zero_placement_family", "replicated") == "autoep_expert"
+                            for param in params), min(param.ds_id for param in params)))
+
+                for process_group_params in ordered_param_groups:
+                    with get_accelerator().stream(self.__allgather_stream):
+                        event_name = __class__.FORWARD_ALL_GATHER if forward else __class__.BACKWARD_ALL_GATHER
+                        self.__profiler.start_event(event_name)
+                        with serialized_autoep_communication("zero_param_all_gather"):
+                            handle = process_group_params[0].all_gather_coalesced(process_group_params,
+                                                                                 quantize=quantize)
+                        self.__profiler.stop_event(event_name,
+                                                   sum(param.ds_numel for param in process_group_params))
+                    for param in process_group_params:
+                        assert param.ds_status == ZeroParamStatus.INFLIGHT, param.ds_summary()
+                        self.__inflight_param_registry[param] = handle
 
             # Release swap buffers for persisted params on nvme since they will never be partitioned or evicted from GPU
             swap_persisted_params = [

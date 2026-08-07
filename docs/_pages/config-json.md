@@ -908,6 +908,7 @@ smoke coverage used for this AutoEP surface produced the following version gates
 | ------ | ---------------------------- | ----- |
 | `mixtral` | `5.0.0` |  |
 | `qwen3_moe` | `5.0.0` | Also covers Qwen2-MoE when the installed Transformers build uses the validated fused expert layout. Qwen3-MoE classes appear in `4.51.3`, but the tested `4.x` builds do not match the validated AutoEP layout. |
+| `qwen3_vl_moe` | `5.2.0` | Supports the Qwen3-VL-MoE text backbone and resolves routing attributes from `text_config`. |
 | `qwen3_5_moe` | `5.2.0` | Requires the Qwen3.5 text-backbone `qwen3_5_moe_text` model type. For performance on Qwen3.5's Gated DeltaNet layers, install optimized kernels; see the [Hugging Face Transformers kernel loading docs](https://huggingface.co/docs/transformers/kernel_doc/loading_kernels) and the [Qwen FlashQLA blog](https://qwen.ai/blog?id=flashqla). |
 | `deepseek_v2` | `5.0.0` | `load_balance_coeff` / expert-bias auxiliary-loss-free load balancing is not currently supported; non-null values are rejected. |
 | `deepseek_v3` | `5.0.0` | `load_balance_coeff` / expert-bias auxiliary-loss-free load balancing is not currently supported; non-null values are rejected. |
@@ -917,6 +918,18 @@ smoke coverage used for this AutoEP surface produced the following version gates
 | Description                                                                                    | Default |
 | ---------------------------------------------------------------------------------------------- | ------- |
 | Use `torch._grouped_mm` for fused grouped GEMM. Raises `RuntimeError` at `GroupedExperts` construction time when `torch._grouped_mm` is unavailable; set `use_grouped_mm=false` to use the sequential for-loop. | `true`  |
+
+***expert_backend***: [string]
+
+| Description | Default |
+|-------------|---------|
+| Expert compute backend. `auto` preserves the existing `use_grouped_mm` behavior. `musa_te` is an explicit MUSA-only backend that keeps fused gate-up expert parameters and uses Transformer Engine grouped GEMM for forward and backward. | `auto` |
+
+***serialize_communications***: [boolean]
+
+| Description | Default |
+|-------------|---------|
+| Preserve the streams selected by ZeRO and AutoEP, but complete each DeepSpeed collective before returning to its caller. Work-like results from `async_op=True` are explicitly waited before synchronizing the caller stream, because MCCL may enqueue work on a backend-owned stream. This disables asynchronous communication overlap while keeping subsystem stream assignments. Intended as a conservative stability mode; it can reduce performance and remains disabled by default. | `false` |
 
 ***moe_layer_pattern***: [string]
 

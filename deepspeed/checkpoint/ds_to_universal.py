@@ -51,6 +51,7 @@ from deepspeed.checkpoint import (
     SubparamShape,
 )
 from deepspeed.checkpoint.autoep_zero3_metadata import (
+    autoep_expert_parameter_names,
     is_autoep_zero3_partitioned_entry,
     validate_autoep_zero3_partitioned_metadata,
 )
@@ -471,8 +472,8 @@ def _autoep_expert_param_info(autoep_metadata):
         prefix = entry.get('expert_key_prefix')
         if not prefix:
             continue
-        for wname in ('w1', 'w2', 'w3'):
-            info[f"{prefix}.{wname}"] = entry
+        for name in autoep_expert_parameter_names(entry):
+            info[f"{prefix}.{name}"] = entry
     return info
 
 
@@ -834,7 +835,13 @@ def main(args):
                 mp_sd = torch.load(f, map_location=torch.device('cpu'), weights_only=False)
                 if UNIVERSAL_CHECKPOINT_INFO not in mp_sd:
                     mp_sd[UNIVERSAL_CHECKPOINT_INFO] = {}
-                mp_sd[UNIVERSAL_CHECKPOINT_INFO][EXPERT_PARAMETER_PATTERNS] = [r'\.experts\.w[123]$']
+                parameter_names = {
+                    name
+                    for entry in autoep_metadata for name in autoep_expert_parameter_names(entry)
+                }
+                mp_sd[UNIVERSAL_CHECKPOINT_INFO][EXPERT_PARAMETER_PATTERNS] = [
+                    rf'\.experts\.{re.escape(name)}$' for name in sorted(parameter_names)
+                ]
                 mp_sd[UNIVERSAL_CHECKPOINT_INFO][AUTOEP_LAYERS_KEY] = autoep_metadata
                 out_path = os.path.join(args.output_folder, os.path.basename(f))
                 torch.save(mp_sd, out_path)
@@ -892,7 +899,13 @@ def main(args):
                 autoep_metadata = _get_autoep_metadata(model_state)
                 if UNIVERSAL_CHECKPOINT_INFO not in model_state:
                     model_state[UNIVERSAL_CHECKPOINT_INFO] = {}
-                model_state[UNIVERSAL_CHECKPOINT_INFO][EXPERT_PARAMETER_PATTERNS] = [r'.*\.experts\.w[123]$']
+                parameter_names = {
+                    name
+                    for entry in autoep_metadata for name in autoep_expert_parameter_names(entry)
+                }
+                model_state[UNIVERSAL_CHECKPOINT_INFO][EXPERT_PARAMETER_PATTERNS] = [
+                    rf'.*\.experts\.{re.escape(name)}$' for name in sorted(parameter_names)
+                ]
                 model_state[UNIVERSAL_CHECKPOINT_INFO][AUTOEP_LAYERS_KEY] = autoep_metadata
                 torch.save(model_state, os.path.join(args.output_folder, os.path.basename(f)))
             else:

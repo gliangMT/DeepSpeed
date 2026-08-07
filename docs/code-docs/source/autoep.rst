@@ -9,6 +9,7 @@ This API is separate from the explicit ``deepspeed.moe.layer.MoE`` layer API.
 For the explicit DeepSpeed MoE layer API, see :doc:`moe`.
 
 **Built-in AutoEP presets:** ``mixtral`` (Mixtral), ``qwen3_moe`` (Qwen3-MoE),
+``qwen3_vl_moe`` (Qwen3-VL-MoE),
 ``qwen3_5_moe`` (Qwen3.5-MoE), ``deepseek_v2`` (DeepSeek-V2), and
 ``deepseek_v3`` (DeepSeek-V3).
 

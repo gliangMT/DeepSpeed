@@ -87,6 +87,7 @@ from deepspeed.checkpoint.constants import (
     UNIVERSAL_CHECKPOINT_VERSION_VALUE,
 )
 from deepspeed.checkpoint.autoep_zero3_metadata import (
+    autoep_expert_parameter_names,
     is_autoep_zero3_partitioned_entry,
     validate_autoep_zero3_partitioned_metadata,
 )
@@ -3910,8 +3911,11 @@ class DeepSpeedEngine(Module):
                     exp_dp_rank = groups._get_expert_data_parallel_rank(group_name)
                     module_prefix = f"{n_module}." if n_module else ""
 
-                    # Collect per-expert tensors to stack
-                    stacked = {wname: [] for wname in ('w1', 'w2', 'w3')}
+                    # Collect per-expert tensors to stack for the selected backend.
+                    expert_parameter_names = [
+                        name for name, _ in module.experts.named_parameters(recurse=False)
+                    ]
+                    stacked = {name: [] for name in expert_parameter_names}
 
                     for local_expert_id in range(num_local_experts):
                         global_expert_id = expp_rank * num_local_experts + local_expert_id
@@ -3930,8 +3934,8 @@ class DeepSpeedEngine(Module):
                             tp_rank=groups.get_tensor_model_parallel_rank() if folded_autoep_tp else None,
                             ep_rank=expp_rank if folded_autoep_tp else None)
 
-                        for wname in ('w1', 'w2', 'w3'):
-                            fused_key = f"{module_prefix}experts.{wname}"
+                        for name in expert_parameter_names:
+                            fused_key = f"{module_prefix}experts.{name}"
                             expert_key = f"{fused_key}.{global_expert_id}"
                             if expert_key not in expert_sd:
                                 raise RuntimeError(f"Expert checkpoint file is corrupt: key '{expert_key}' not found "
@@ -3940,12 +3944,12 @@ class DeepSpeedEngine(Module):
                             if tensor.dim() != 2:
                                 raise RuntimeError(f"Expert checkpoint file is corrupt: expected 2D tensor for "
                                                    f"'{expert_key}', got {tensor.dim()}D in {expert_ckpt_path}")
-                            stacked[wname].append(tensor)
+                            stacked[name].append(tensor)
 
                     # Stack back to fused [E_local, ...] format
-                    for wname in ('w1', 'w2', 'w3'):
-                        fused_key = f"{module_prefix}experts.{wname}"
-                        state_dict[fused_key] = torch.stack(stacked[wname], dim=0)
+                    for name in expert_parameter_names:
+                        fused_key = f"{module_prefix}experts.{name}"
+                        state_dict[fused_key] = torch.stack(stacked[name], dim=0)
 
                     moe_layer_id += 1
 
@@ -4213,7 +4217,7 @@ class DeepSpeedEngine(Module):
                     continue
                 prefix = entry.get('expert_key_prefix')
                 if prefix:
-                    names.update(f"{prefix}.{wname}" for wname in ('w1', 'w2', 'w3'))
+                    names.update(f"{prefix}.{name}" for name in autoep_expert_parameter_names(entry))
 
         if names:
             return names
@@ -4229,7 +4233,8 @@ class DeepSpeedEngine(Module):
             if not isinstance(module, _AutoEPMoELayer):
                 continue
             module_prefix = f"{module_name}." if module_name else ""
-            names.update(f"{module_prefix}experts.{wname}" for wname in ('w1', 'w2', 'w3'))
+            names.update(f"{module_prefix}experts.{name}"
+                         for name, _ in module.experts.named_parameters(recurse=False))
         return names
 
     def _load_checkpoint(self,
@@ -4672,7 +4677,7 @@ class DeepSpeedEngine(Module):
     def _get_non_moe_state_dict(self, full_state_dict):
         """Remove expert-param keys from state dict, keeping all non-expert params.
 
-        Handles both native MoE (deepspeed_moe.experts.*) and AutoEP (experts.w1/w2/w3).
+        Handles native MoE and backend-specific direct AutoEP expert parameters.
         Preserves: router weights, shared_experts, any legacy/manually-built
         expert_bias keys, all non-MoE params.
         """
@@ -4691,10 +4696,11 @@ class DeepSpeedEngine(Module):
                     if key.startswith(module_prefix) and 'expert' in key and 'moe.gate.wg.weight' not in key:
                         expert_param_keys.add(key)
             elif _AutoEPMoELayer is not None and isinstance(module, _AutoEPMoELayer):
-                # AutoEP: remove only the fused expert weight keys (w1, w2, w3)
+                # AutoEP expert backends expose their expert-axis parameters directly.
                 experts_prefix = f"{module_prefix}experts."
+                expert_parameter_names = set(dict(module.experts.named_parameters(recurse=False)))
                 for key in full_state_dict.keys():
-                    if key.startswith(experts_prefix) and key[len(experts_prefix):] in ('w1', 'w2', 'w3'):
+                    if key.startswith(experts_prefix) and key[len(experts_prefix):] in expert_parameter_names:
                         expert_param_keys.add(key)
 
         for key in expert_param_keys:
@@ -4835,10 +4841,12 @@ class DeepSpeedEngine(Module):
                 expp_rank = groups._get_expert_parallel_rank(group_name)
                 exp_dp_rank = groups._get_expert_data_parallel_rank(group_name)
                 module_prefix = f"{n_module}." if n_module else ""
-                expert_params = [getattr(module.experts, wname) for wname in ('w1', 'w2', 'w3')]
+                named_expert_params = list(module.experts.named_parameters(recurse=False))
+                expert_parameter_names = [name for name, _ in named_expert_params]
+                expert_params = [param for _, param in named_expert_params]
                 if self.zero_optimization_partition_weights():
                     frozen_expert_names = [
-                        f"{module_prefix}experts.{wname}" for wname, param in zip(('w1', 'w2', 'w3'), expert_params)
+                        f"{module_prefix}experts.{name}" for name, param in named_expert_params
                         if not param.requires_grad
                     ]
                     if frozen_expert_names:
@@ -4860,6 +4868,8 @@ class DeepSpeedEngine(Module):
                     module.ep_size,
                     'expert_key_prefix':
                     f"{module_prefix}experts",
+                    'expert_parameter_names':
+                    expert_parameter_names,
                     AUTOEP_ZERO3_EXPERT_STATE_FORMAT_KEY:
                     AUTOEP_ZERO3_PARTITIONED_EXPERT_STATE_FORMAT
                     if self.zero_optimization_partition_weights() else 'per_expert_files',
@@ -4896,9 +4906,8 @@ class DeepSpeedEngine(Module):
                         for local_expert_id in range(num_local_experts):
                             global_expert_id = expp_rank * num_local_experts + local_expert_id
                             expert_state_dict = {}
-                            for wname in ('w1', 'w2', 'w3'):
-                                fused_key = f"{module_prefix}experts.{wname}"
-                                param = getattr(module.experts, wname)
+                            for name, param in named_expert_params:
+                                fused_key = f"{module_prefix}experts.{name}"
                                 expert_state_dict[f"{fused_key}.{global_expert_id}"] = (
                                     param[local_expert_id].clone().detach())
                             if folded_autoep_tp:
@@ -4982,7 +4991,13 @@ class DeepSpeedEngine(Module):
             if autoep_layer_info:
                 universal_checkpoint_info.setdefault(UNIVERSAL_CHECKPOINT_VERSION_KEY,
                                                      UNIVERSAL_CHECKPOINT_VERSION_VALUE)
-                universal_checkpoint_info[EXPERT_PARAMETER_PATTERNS] = [r'.*\.experts\.w[123]$']
+                parameter_names = {
+                    name
+                    for entry in autoep_layer_info for name in autoep_expert_parameter_names(entry)
+                }
+                universal_checkpoint_info[EXPERT_PARAMETER_PATTERNS] = [
+                    rf'.*\.experts\.{re.escape(name)}$' for name in sorted(parameter_names)
+                ]
                 universal_checkpoint_info['ds_autoep_layers'] = autoep_layer_info
 
             state = self._common_checkpoint_state(model_state_dict, zero_optimizer_state, save_frozen_param)
@@ -5376,8 +5391,8 @@ class DeepSpeedEngine(Module):
         path = os.path.join(save_dir, save_filename)
 
         if self.zero_optimization_partition_weights():
-            self._raise_if_autoep_zero3_consolidated_export("save_16bit_model")
             if self.zero_gather_16bit_weights_on_model_save():
+                self._raise_if_autoep_zero3_consolidated_export("save_16bit_model")
                 # consolidation is expensive in time and memory and therefore isn't a default
                 state_dict = self._zero3_consolidated_16bit_state_dict(
                     exclude_frozen_parameters=exclude_frozen_parameters)

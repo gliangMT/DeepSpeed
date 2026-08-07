@@ -105,6 +105,8 @@ class AutoEPConfig:
     expert_pattern: str | None = None
     router_pattern: str | None = None
     use_grouped_mm: bool = True
+    expert_backend: Literal["auto", "musa_te"] = "auto"
+    serialize_communications: bool = False
     route_norm: bool | None = None
     route_scale: float = 1.0
     score_apply: Literal["auto", "pre", "post"] = "auto"
@@ -237,6 +239,10 @@ class AutoEPPresetAdapter:
         if cfg_norm is not None:
             return bool(cfg_norm)
         return preset.route_norm
+
+    def resolve_model_config(self, model_config):
+        """Return the config object that owns MoE routing attributes."""
+        return model_config
 
     def resolve_group_routing(
         self,
