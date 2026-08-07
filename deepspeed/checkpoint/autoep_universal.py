@@ -12,6 +12,8 @@ import os
 import glob
 import torch
 
+from .autoep_zero3_metadata import autoep_expert_parameter_names
+
 from .constants import (
     PARAM,
     CAT_DIM,
@@ -232,7 +234,7 @@ def consolidate_autoep_expert_files(checkpoint_dir, output_dir, autoep_layers_me
         num_experts = layer_info['num_experts']
         prefix = layer_info['expert_key_prefix']
 
-        for wname in ('w1', 'w2', 'w3'):
+        for wname in autoep_expert_parameter_names(layer_info):
             expert_tensors = []
             folding_metadata = None
             for global_eid in range(num_experts):
@@ -322,7 +324,8 @@ def consolidate_autoep_optimizer_states(checkpoint_dir, output_dir, autoep_layer
         layer_param_ids = {}
 
         # If optimizer state carries param names, map weights by exact identity.
-        for wname in ('w1', 'w2', 'w3'):
+        expert_parameter_names = autoep_expert_parameter_names(layer_info)
+        for wname in expert_parameter_names:
             param_name = f"{prefix}.{wname}"
             param_id = name_to_param_id.get(param_name)
             if param_id is None:
@@ -331,7 +334,7 @@ def consolidate_autoep_optimizer_states(checkpoint_dir, output_dir, autoep_layer
             consumed_param_ids.add(str(param_id))
 
         # Fallback: consume expert-like params in optimizer param_groups order.
-        missing_wnames = [w for w in ('w1', 'w2', 'w3') if w not in layer_param_ids]
+        missing_wnames = [name for name in expert_parameter_names if name not in layer_param_ids]
         if missing_wnames:
             candidates = []
             for param_id in ordered_param_ids:
@@ -348,7 +351,7 @@ def consolidate_autoep_optimizer_states(checkpoint_dir, output_dir, autoep_layer
                 layer_param_ids[wname] = param_id
                 consumed_param_ids.add(str(param_id))
 
-        for wname in ('w1', 'w2', 'w3'):
+        for wname in expert_parameter_names:
             param_name = f"{prefix}.{wname}"
             param_dir = os.path.join(output_dir, "zero", param_name)
             os.makedirs(param_dir, exist_ok=True)

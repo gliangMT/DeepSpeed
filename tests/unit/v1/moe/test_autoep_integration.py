@@ -38,6 +38,53 @@ def _assert_global_grad_norm_consistent(engine):
 class TestAutoEPOnly(DistributedTest):
     world_size = 2
 
+    def test_precreated_client_optimizer_rebinds_after_autoep_replacement(self):
+        _seed_everything(1234)
+
+        model = MockMoETransformer(num_layers=1)
+        old_moe_parameters = list(model.model.layers[0].mlp.parameters())
+        decay_parameters = [parameter for parameter in model.parameters() if parameter.ndim > 1]
+        no_decay_parameters = [parameter for parameter in model.parameters() if parameter.ndim <= 1]
+        client_optimizer = torch.optim.AdamW([
+            {
+                "params": decay_parameters,
+                "lr": 3e-4,
+                "weight_decay": 0.1,
+            },
+            {
+                "params": no_decay_parameters,
+                "lr": 2e-4,
+                "weight_decay": 0.0,
+            },
+        ])
+        model_parameters = list(model.parameters())
+        group_options = [(group["lr"], group["weight_decay"]) for group in client_optimizer.param_groups]
+        config = _make_autoep_config(zero_stage=0, ep_size=2)
+        del config["optimizer"]
+
+        engine, _, _, _ = deepspeed.initialize(
+            model=model,
+            optimizer=client_optimizer,
+            model_parameters=model_parameters,
+            config=config,
+        )
+
+        current_parameters = [parameter for parameter in engine.module.parameters() if parameter.requires_grad]
+        current_ids = {id(parameter) for parameter in current_parameters}
+        optimizer_ids = [id(parameter) for group in client_optimizer.param_groups for parameter in group["params"]]
+        old_moe_ids = {id(parameter) for parameter in old_moe_parameters}
+        assert engine.basic_optimizer is client_optimizer
+        assert len(optimizer_ids) == len(set(optimizer_ids))
+        assert set(optimizer_ids) == current_ids
+        assert not (old_moe_ids & set(optimizer_ids))
+        assert [(group["lr"], group["weight_decay"]) for group in client_optimizer.param_groups] == group_options
+
+        from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer
+        autoep_layer = next(module for module in engine.module.modules() if isinstance(module, AutoEPMoELayer))
+        decay_ids = {id(parameter) for parameter in client_optimizer.param_groups[0]["params"]}
+        assert id(autoep_layer.router.gate.weight) in decay_ids
+        assert {id(parameter) for parameter in autoep_layer.experts.parameters()} <= decay_ids
+
     def test_zero2_ep_2gpu(self):
         """EP with ZeRO-2 training.
 

@@ -119,7 +119,22 @@ def timed_op(func):
                 timers(log_name).start()
         # Return the op, then stop the op's timer
         try:
-            return func(*args, **kwargs)
+            # AutoEP mixes world-DP, expert-DP and expert-parallel process
+            # groups.  When explicitly requested, put every DeepSpeed
+            # collective in the same process-local communication sequence,
+            # including optimizer-tail norm/overflow reductions that are not
+            # owned by the AutoEP layer itself.
+            from deepspeed.runtime.comm.autoep_serialization import (
+                complete_autoep_communication,
+                serialized_autoep_communication,
+            )
+            with serialized_autoep_communication(func.__name__):
+                result = func(*args, **kwargs)
+                # async_op=True may enqueue MCCL work on a backend-owned
+                # stream.  Waiting on the returned work is required before a
+                # different process-group collective is allowed to start.
+                complete_autoep_communication(result)
+                return result
         finally:
             if comms_logger.enabled:
                 # Need to make op blocking for accurate logging

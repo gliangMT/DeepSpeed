@@ -25,8 +25,19 @@ from deepspeed.utils import logger
 from deepspeed.moe.ep_router import TokenChoiceTopKRouter
 from deepspeed.moe.ep_count import count_tokens_per_expert
 from deepspeed.moe.ep_experts import GroupedExperts
+from deepspeed.moe.ep_experts_musa import MusaTEGroupedExperts
 from deepspeed.moe.ep_kernels import TokenReorderer
-from deepspeed.moe.ep_repack import _gather_source_zero_params, repack_expert_requires_grad_flags, repack_expert_weights
+from deepspeed.moe.ep_repack import (
+    _gather_source_zero_params,
+    repack_expert_requires_grad_flags,
+    repack_expert_weights,
+    repack_fused_expert_requires_grad_flags,
+    repack_fused_expert_weights,
+)
+from deepspeed.runtime.comm.autoep_serialization import (
+    enable_autoep_communication_serialization,
+    serialized_autoep_communication,
+)
 
 # ---------------------------------------------------------------------------
 # Named tuples
@@ -44,6 +55,11 @@ class SplitPlan(NamedTuple):
     output_splits: list[int]  # len=ep_size
     local_counts: torch.Tensor  # [E_local]
     local_counts_by_source: torch.Tensor  # [ep_size, E_local]
+
+
+def _serialized_all_to_all_single(label: str, output: torch.Tensor, input: torch.Tensor, **kwargs) -> None:
+    with serialized_autoep_communication(label):
+        dist.all_to_all_single(output, input, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +155,8 @@ def compute_split_plan(
     local_counts_tensor = count_matrix.sum(dim=1).clone()  # [ep_size]
     remote_counts_tensor = torch.zeros_like(local_counts_tensor)
 
-    dist.all_to_all_single(
+    _serialized_all_to_all_single(
+        "autoep_split_counts",
         remote_counts_tensor,
         local_counts_tensor,
         group=ep_group,
@@ -155,7 +172,8 @@ def compute_split_plan(
     local_expert_counts_flat = local_expert_counts.view(-1).contiguous()  # [ep_size * E_local]
     received_counts_flat = torch.zeros_like(local_expert_counts_flat)
 
-    dist.all_to_all_single(
+    _serialized_all_to_all_single(
+        "autoep_split_expert_counts",
         received_counts_flat,
         local_expert_counts_flat,
         group=ep_group,
@@ -191,12 +209,18 @@ def compute_split_plan_from_expert_indices(
     input_splits = count_matrix.sum(dim=1).cpu().tolist()
     local_counts_tensor = count_matrix.sum(dim=1).clone()
     remote_counts_tensor = torch.zeros_like(local_counts_tensor)
-    dist.all_to_all_single(remote_counts_tensor, local_counts_tensor, group=ep_group)
+    _serialized_all_to_all_single("autoep_folded_split_counts",
+                                  remote_counts_tensor,
+                                  local_counts_tensor,
+                                  group=ep_group)
     output_splits = remote_counts_tensor.cpu().tolist()
 
     local_expert_counts_flat = count_matrix.reshape(-1).contiguous()
     received_counts_flat = torch.zeros_like(local_expert_counts_flat)
-    dist.all_to_all_single(received_counts_flat, local_expert_counts_flat, group=ep_group)
+    _serialized_all_to_all_single("autoep_folded_split_expert_counts",
+                                  received_counts_flat,
+                                  local_expert_counts_flat,
+                                  group=ep_group)
     received_counts = received_counts_flat.view(ep_size, num_local_experts)
     local_counts = received_counts.sum(dim=0)
     return SplitPlan(input_splits, output_splits, local_counts, received_counts)
@@ -218,7 +242,8 @@ class _AllToAllV(torch.autograd.Function):
             device=x.device,
         )
 
-        dist.all_to_all_single(
+        _serialized_all_to_all_single(
+            "autoep_token_dispatch",
             output,
             x.contiguous(),
             output_split_sizes=output_splits,
@@ -238,7 +263,8 @@ class _AllToAllV(torch.autograd.Function):
             device=grad_out.device,
         )
 
-        dist.all_to_all_single(
+        _serialized_all_to_all_single(
+            "autoep_token_dispatch_backward",
             grad_input,
             grad_out,
             output_split_sizes=ctx.input_splits,
@@ -410,6 +436,8 @@ class AutoEPMoELayer(nn.Module):
         self.tp_group = None
         resolved_config = resolve_autoep_config_defaults(config, spec.model_family)
         self.validate_folding_routing = bool(resolved_config.validate_folding_routing)
+        if resolved_config.serialize_communications:
+            enable_autoep_communication_serialization()
 
         # Router: copy gate weights from source
         source_gate = getattr(source_module, spec.router_name)
@@ -465,31 +493,52 @@ class AutoEPMoELayer(nn.Module):
             else:
                 setattr(self, alias_target, self.router)
 
-        # Experts: extract local expert weights
-        w1, w2, w3 = repack_expert_weights(
-            experts_source=getattr(source_module, spec.experts_name),
-            spec=spec,
-            ep_rank=ep_rank,
-            ep_size=ep_size,
-        )
-        w1_requires_grad, w2_requires_grad, w3_requires_grad = repack_expert_requires_grad_flags(
-            experts_source=getattr(source_module, spec.experts_name),
-            spec=spec,
-            ep_rank=ep_rank,
-            ep_size=ep_size,
-        )
-        self.experts = GroupedExperts(
-            dim=spec.hidden_size,
-            hidden_dim=spec.ffn_hidden_size,
-            num_experts=self.num_local_experts,
-            use_grouped_mm=config.use_grouped_mm,
-        )
-        _copy_parameter_data(self.experts.w1, w1)
-        _copy_parameter_data(self.experts.w2, w2)
-        _copy_parameter_data(self.experts.w3, w3)
-        self.experts.w1.requires_grad_(w1_requires_grad)
-        self.experts.w2.requires_grad_(w2_requires_grad)
-        self.experts.w3.requires_grad_(w3_requires_grad)
+        experts_source = getattr(source_module, spec.experts_name)
+        if config.expert_backend == "musa_te":
+            gate_up, down = repack_fused_expert_weights(
+                experts_source=experts_source,
+                spec=spec,
+                ep_rank=ep_rank,
+                ep_size=ep_size,
+            )
+            gate_up_requires_grad, down_requires_grad = repack_fused_expert_requires_grad_flags(
+                experts_source=experts_source,
+                spec=spec,
+            )
+            self.experts = MusaTEGroupedExperts(
+                dim=spec.hidden_size,
+                hidden_dim=spec.ffn_hidden_size,
+                num_experts=self.num_local_experts,
+            )
+            _copy_parameter_data(self.experts.gate_up_proj, gate_up)
+            _copy_parameter_data(self.experts.down_proj, down)
+            self.experts.gate_up_proj.requires_grad_(gate_up_requires_grad)
+            self.experts.down_proj.requires_grad_(down_requires_grad)
+        else:
+            w1, w2, w3 = repack_expert_weights(
+                experts_source=experts_source,
+                spec=spec,
+                ep_rank=ep_rank,
+                ep_size=ep_size,
+            )
+            w1_requires_grad, w2_requires_grad, w3_requires_grad = repack_expert_requires_grad_flags(
+                experts_source=experts_source,
+                spec=spec,
+                ep_rank=ep_rank,
+                ep_size=ep_size,
+            )
+            self.experts = GroupedExperts(
+                dim=spec.hidden_size,
+                hidden_dim=spec.ffn_hidden_size,
+                num_experts=self.num_local_experts,
+                use_grouped_mm=config.use_grouped_mm,
+            )
+            _copy_parameter_data(self.experts.w1, w1)
+            _copy_parameter_data(self.experts.w2, w2)
+            _copy_parameter_data(self.experts.w3, w3)
+            self.experts.w1.requires_grad_(w1_requires_grad)
+            self.experts.w2.requires_grad_(w2_requires_grad)
+            self.experts.w3.requires_grad_(w3_requires_grad)
 
         self.reorderer = TokenReorderer(num_experts=self.num_experts, top_k=self.top_k)
         self.shared_experts = getattr(source_module, spec.shared_experts_name,

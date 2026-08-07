@@ -30,6 +30,22 @@ AUTOEP_ZERO3_PARTITIONED_METADATA_FIELDS = frozenset({
     'global_expert_end',
 })
 
+_LEGACY_AUTOEP_EXPERT_PARAMETER_NAMES = ("w1", "w2", "w3")
+
+
+def autoep_expert_parameter_names(entry):
+    """Return direct expert parameter names, preserving legacy metadata."""
+    names = entry.get('expert_parameter_names') if isinstance(entry, dict) else None
+    if names is None:
+        return _LEGACY_AUTOEP_EXPERT_PARAMETER_NAMES
+    if not isinstance(names, (list, tuple)) or not names:
+        raise RuntimeError("ds_autoep_layers expert_parameter_names must be a non-empty list")
+    if any(not isinstance(name, str) or not name or '.' in name for name in names):
+        raise RuntimeError("ds_autoep_layers expert_parameter_names must contain direct parameter names")
+    if len(set(names)) != len(names):
+        raise RuntimeError("ds_autoep_layers expert_parameter_names contains duplicates")
+    return tuple(names)
+
 
 def is_autoep_zero3_partitioned_entry(entry):
     return (isinstance(entry, dict)
@@ -65,6 +81,7 @@ def validate_autoep_zero3_partitioned_metadata(autoep_metadata,
         if prefix in seen_prefixes:
             raise RuntimeError(f"ds_autoep_layers metadata has duplicate expert_key_prefix: {prefix}")
         seen_prefixes.add(prefix)
+        autoep_expert_parameter_names(entry)
 
         if not is_autoep_zero3_partitioned_entry(entry):
             continue

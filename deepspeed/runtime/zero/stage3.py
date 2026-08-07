@@ -21,6 +21,7 @@ from deepspeed.utils.torch import register_grad_hook, required_torch_version
 from deepspeed.runtime.fp16.loss_scaler import CreateLossScaler
 from deepspeed.runtime.torch_autocast import get_autocast_dtype, get_all_comm_dtypes, is_autocast_initialized, sort_dtypes
 from deepspeed.runtime.comm.coalesced_collectives import reduce_scatter_coalesced, all_to_all_quant_reduce, all_to_all_loco_quant_reduce
+from deepspeed.runtime.comm.autoep_serialization import serialized_autoep_communication
 from deepspeed.runtime.utils import inf, is_model_parallel_parameter, mask_nan_or_inf_with_val_inplace, count_used_parameters_in_backward
 from deepspeed.runtime.zero.partition_parameters import *
 from deepspeed.runtime.zero.config import ZeroStageEnum
@@ -1493,7 +1494,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             return
 
         self._assert_same_partition_group(params_in_bucket)
-
         for param in params_in_bucket:
             if param.grad.numel() != param.ds_numel:
                 raise RuntimeError(f"{param.grad.numel()} != {param.ds_numel} Cannot reduce scatter "
@@ -1507,23 +1507,24 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             self.param_reduce_events.popleft().synchronize()
 
         with get_accelerator().stream(self.reduce_and_partition_stream):
-            if self.enable_sanity_checks:
-                assert_ints_same_as_other_ranks([p.ds_id for p in params_in_bucket])
+            with serialized_autoep_communication("zero_gradient_reduce"):
+                if self.enable_sanity_checks:
+                    assert_ints_same_as_other_ranks([p.ds_id for p in params_in_bucket])
 
-            if self.contiguous_gradients and bucket.elements <= self.reduce_bucket_size and not self.reduce_scatter:
-                grad_bucket = bucket.buffer.narrow(0, 0, bucket.elements)
-                grad_partitions = self.__avg_scatter_contiguous_grads(grad_bucket, communication_data_type)
-            else:
-                params_in_bucket.sort(key=lambda p: p.ds_id)
-                grad_partitions = self.__avg_scatter_grads(params_in_bucket, communication_data_type)
+                if self.contiguous_gradients and bucket.elements <= self.reduce_bucket_size and not self.reduce_scatter:
+                    grad_bucket = bucket.buffer.narrow(0, 0, bucket.elements)
+                    grad_partitions = self.__avg_scatter_contiguous_grads(grad_bucket, communication_data_type)
+                else:
+                    params_in_bucket.sort(key=lambda p: p.ds_id)
+                    grad_partitions = self.__avg_scatter_grads(params_in_bucket, communication_data_type)
 
-            if self.is_zenflow_select_boundary():
-                self.update_selected_channels(params_in_bucket, grad_partitions)
+                if self.is_zenflow_select_boundary():
+                    self.update_selected_channels(params_in_bucket, grad_partitions)
 
-            if self.zenflow and self.micro_step >= self.full_warm_up_rounds:
-                self._process_selected_fp32_groups_grad(params_in_bucket, grad_partitions)
+                if self.zenflow and self.micro_step >= self.full_warm_up_rounds:
+                    self._process_selected_fp32_groups_grad(params_in_bucket, grad_partitions)
 
-            self.partition_grads(params_in_bucket, grad_partitions)
+                self.partition_grads(params_in_bucket, grad_partitions)
 
             params_in_bucket.clear()
             bucket.elements = 0

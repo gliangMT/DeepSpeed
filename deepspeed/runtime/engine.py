@@ -87,6 +87,7 @@ from deepspeed.checkpoint.constants import (
     UNIVERSAL_CHECKPOINT_VERSION_VALUE,
 )
 from deepspeed.checkpoint.autoep_zero3_metadata import (
+    autoep_expert_parameter_names,
     is_autoep_zero3_partitioned_entry,
     validate_autoep_zero3_partitioned_metadata,
 )
@@ -156,6 +157,129 @@ MEMORY_OPT_ALLREDUCE_SIZE = 500000000
 DeepSpeedOptimizerCallable = \
     Callable[[Union[Iterable[Parameter], Dict[str, Iterable]]], Optimizer]
 DeepSpeedSchedulerCallable = Callable[[Optimizer], _LRScheduler]
+
+
+def _remap_autoep_parameter_groups(parameter_groups, parameter_remaps, current_parameters, context):
+    """Return remapped parameter lists without mutating the caller's groups."""
+    current_parameter_ids = {id(parameter) for parameter in current_parameters}
+    parameter_locations = defaultdict(list)
+    for group_index, parameters in enumerate(parameter_groups):
+        for parameter in parameters:
+            parameter_locations[id(parameter)].append(group_index)
+
+    active_remaps = {}
+    source_to_remap = {}
+    target_to_remap = {}
+    for remap_index, remap in enumerate(parameter_remaps):
+        for source in remap.sources:
+            previous = source_to_remap.setdefault(id(source), remap_index)
+            if previous != remap_index:
+                raise RuntimeError(f"AutoEP source parameter belongs to multiple remaps while updating {context}.")
+        for target in remap.targets:
+            previous = target_to_remap.setdefault(id(target), remap_index)
+            if previous != remap_index:
+                raise RuntimeError(f"AutoEP target parameter belongs to multiple remaps while updating {context}.")
+
+        source_locations = [parameter_locations.get(id(source), []) for source in remap.sources]
+        present_source_count = sum(bool(locations) for locations in source_locations)
+        if present_source_count == 0:
+            continue
+        if present_source_count != len(remap.sources):
+            raise RuntimeError(f"AutoEP parameter remap '{remap.role}' is only partially present in {context}.")
+        if any(len(locations) != 1 for locations in source_locations):
+            raise RuntimeError(f"AutoEP parameter remap '{remap.role}' contains a duplicated source in {context}.")
+
+        source_group_indices = {locations[0] for locations in source_locations}
+        if len(source_group_indices) != 1:
+            raise RuntimeError(f"AutoEP parameter remap '{remap.role}' spans multiple groups in {context}.")
+        if any(parameter_locations.get(id(target)) for target in remap.targets):
+            raise RuntimeError(f"AutoEP parameter remap '{remap.role}' has both source and target parameters in "
+                               f"{context}.")
+        if any(id(target) not in current_parameter_ids for target in remap.targets):
+            raise RuntimeError(f"AutoEP parameter remap '{remap.role}' targets a parameter outside the current model.")
+        active_remaps[remap_index] = next(iter(source_group_indices))
+
+    remapped_groups = []
+    emitted_remaps = set()
+    emitted_parameter_ids = set()
+    for group_index, parameters in enumerate(parameter_groups):
+        remapped_parameters = []
+        for parameter in parameters:
+            remap_index = source_to_remap.get(id(parameter))
+            if remap_index is not None:
+                if active_remaps.get(remap_index) != group_index or remap_index in emitted_remaps:
+                    continue
+                for target in parameter_remaps[remap_index].targets:
+                    if id(target) in emitted_parameter_ids:
+                        raise RuntimeError(f"AutoEP produced a duplicated target parameter while updating {context}.")
+                    remapped_parameters.append(target)
+                    emitted_parameter_ids.add(id(target))
+                emitted_remaps.add(remap_index)
+                continue
+
+            if id(parameter) not in current_parameter_ids:
+                raise RuntimeError(f"AutoEP found an unmapped stale parameter while updating {context}.")
+            if id(parameter) in emitted_parameter_ids:
+                raise RuntimeError(f"AutoEP found a duplicated current parameter while updating {context}.")
+            remapped_parameters.append(parameter)
+            emitted_parameter_ids.add(id(parameter))
+        remapped_groups.append(remapped_parameters)
+
+    if emitted_remaps != set(active_remaps):
+        raise RuntimeError(f"AutoEP did not emit every active parameter remap while updating {context}.")
+    return remapped_groups
+
+
+def _remap_autoep_model_parameters(model_parameters, parameter_remaps, current_parameters):
+    """Refresh an eagerly materialized model-parameter list after AutoEP replacement."""
+    if not parameter_remaps:
+        return model_parameters
+    if model_parameters and any(isinstance(group, dict) for group in model_parameters):
+        if not all(isinstance(group, dict) and "params" in group for group in model_parameters):
+            raise RuntimeError("AutoEP requires model_parameters to be either parameters or parameter-group dicts.")
+        parameter_groups = [list(group["params"]) for group in model_parameters]
+        remapped_groups = _remap_autoep_parameter_groups(parameter_groups, parameter_remaps, current_parameters,
+                                                         "model_parameters")
+        result = []
+        for group, remapped_parameters in zip(model_parameters, remapped_groups):
+            remapped_group = dict(group)
+            remapped_group["params"] = remapped_parameters
+            result.append(remapped_group)
+        return result
+
+    remapped_groups = _remap_autoep_parameter_groups([list(model_parameters)], parameter_remaps, current_parameters,
+                                                     "model_parameters")
+    return remapped_groups[0]
+
+
+def _rebind_autoep_client_optimizer(optimizer, parameter_remaps, current_parameters):
+    """Rebind a newly created client optimizer to AutoEP replacement parameters."""
+    parameter_groups = [list(group["params"]) for group in optimizer.param_groups]
+    optimizer_parameter_ids = {id(parameter) for parameters in parameter_groups for parameter in parameters}
+
+    for remap in parameter_remaps:
+        present_sources = [source for source in remap.sources if id(source) in optimizer_parameter_ids]
+        if not present_sources:
+            continue
+        for source in present_sources:
+            if source.grad is not None:
+                raise RuntimeError(f"AutoEP cannot replace optimizer parameter '{remap.role}' after gradients exist.")
+            if source in optimizer.state and optimizer.state[source]:
+                raise RuntimeError(f"AutoEP cannot replace optimizer parameter '{remap.role}' after state exists.")
+            if getattr(source, "_backward_hooks", None) or getattr(source, "_post_accumulate_grad_hooks", None):
+                raise RuntimeError(f"AutoEP cannot replace optimizer parameter '{remap.role}' after parameter hooks "
+                                   "are registered.")
+
+    remapped_groups = _remap_autoep_parameter_groups(parameter_groups, parameter_remaps, current_parameters,
+                                                     "client optimizer")
+    for group, remapped_parameters in zip(optimizer.param_groups, remapped_groups):
+        group["params"] = remapped_parameters
+    for remap in parameter_remaps:
+        for source in remap.sources:
+            if source in optimizer.state:
+                del optimizer.state[source]
+    return optimizer
+
 
 try:
     import apex
@@ -308,7 +432,7 @@ class DeepSpeedEngine(Module):
         self._do_sanity_check()
         if self.log_level() is not None:
             set_log_level_from_string(self.log_level())
-        self._configure_expert_parallel(model)
+        autoep_replacement_plan = self._configure_expert_parallel(model)
         if self.autotp_size() > 1:
             self._configure_tensor_parallel(model, self.tensor_parallel_config())
         see_memory_usage("DeepSpeed Engine: After args sanity test", force=self.memory_breakdown())
@@ -377,6 +501,19 @@ class DeepSpeedEngine(Module):
         # Convert model parameters from generator to list
         if not isinstance(model_parameters, list):
             model_parameters = list(model_parameters)
+        if autoep_replacement_plan is not None and autoep_replacement_plan.parameter_remaps:
+            current_model_parameters = list(self.module.parameters())
+            model_parameters = _remap_autoep_model_parameters(
+                model_parameters,
+                autoep_replacement_plan.parameter_remaps,
+                current_model_parameters,
+            )
+            if isinstance(optimizer, Optimizer):
+                _rebind_autoep_client_optimizer(
+                    optimizer,
+                    autoep_replacement_plan.parameter_remaps,
+                    current_model_parameters,
+                )
 
         # grad scaler only for Z0 (no ZeRO) + fp16 + torch_autocast
         # ZeRO1/2/3 optimizers have their own grad scaler logic
@@ -536,7 +673,7 @@ class DeepSpeedEngine(Module):
         """Initialize AutoEP: detect MoE layers, create EP groups, replace with EP-enabled layers."""
         autoep_config = self._config.expert_parallel_config
         if autoep_config is None or not autoep_config.enabled:
-            return
+            return None
 
         from deepspeed.module_inject.auto_ep import AutoEP
         from deepspeed.module_inject.auto_ep_config import validate_autoep_config, validate_autoep_post_detection
@@ -604,12 +741,14 @@ class DeepSpeedEngine(Module):
 
         if specs:
             validate_autoep_post_detection(autoep_config, specs)
-            auto_ep.replace_moe_layers(specs, ep_size=ep_size, ep_rank=ep_rank)
+            replacement_plan = auto_ep.replace_moe_layers(specs, ep_size=ep_size, ep_rank=ep_rank)
             logger.info(f"AutoEP: replaced {len(specs)} MoE layer(s) with ep_size={ep_size}")
 
             # Re-tag optimizer flags for newly created AutoEP parameters
             from deepspeed import set_optimizer_flags
             set_optimizer_flags(self._config, model)
+            return replacement_plan
+        return None
 
     def _autoep_sequence_parallel_world_size(self):
         if self.mpu is not None and hasattr(self.mpu, 'get_sequence_parallel_world_size'):
@@ -3910,8 +4049,9 @@ class DeepSpeedEngine(Module):
                     exp_dp_rank = groups._get_expert_data_parallel_rank(group_name)
                     module_prefix = f"{n_module}." if n_module else ""
 
-                    # Collect per-expert tensors to stack
-                    stacked = {wname: [] for wname in ('w1', 'w2', 'w3')}
+                    # Collect per-expert tensors to stack for the selected backend.
+                    expert_parameter_names = [name for name, _ in module.experts.named_parameters(recurse=False)]
+                    stacked = {name: [] for name in expert_parameter_names}
 
                     for local_expert_id in range(num_local_experts):
                         global_expert_id = expp_rank * num_local_experts + local_expert_id
@@ -3930,8 +4070,8 @@ class DeepSpeedEngine(Module):
                             tp_rank=groups.get_tensor_model_parallel_rank() if folded_autoep_tp else None,
                             ep_rank=expp_rank if folded_autoep_tp else None)
 
-                        for wname in ('w1', 'w2', 'w3'):
-                            fused_key = f"{module_prefix}experts.{wname}"
+                        for name in expert_parameter_names:
+                            fused_key = f"{module_prefix}experts.{name}"
                             expert_key = f"{fused_key}.{global_expert_id}"
                             if expert_key not in expert_sd:
                                 raise RuntimeError(f"Expert checkpoint file is corrupt: key '{expert_key}' not found "
@@ -3940,12 +4080,12 @@ class DeepSpeedEngine(Module):
                             if tensor.dim() != 2:
                                 raise RuntimeError(f"Expert checkpoint file is corrupt: expected 2D tensor for "
                                                    f"'{expert_key}', got {tensor.dim()}D in {expert_ckpt_path}")
-                            stacked[wname].append(tensor)
+                            stacked[name].append(tensor)
 
                     # Stack back to fused [E_local, ...] format
-                    for wname in ('w1', 'w2', 'w3'):
-                        fused_key = f"{module_prefix}experts.{wname}"
-                        state_dict[fused_key] = torch.stack(stacked[wname], dim=0)
+                    for name in expert_parameter_names:
+                        fused_key = f"{module_prefix}experts.{name}"
+                        state_dict[fused_key] = torch.stack(stacked[name], dim=0)
 
                     moe_layer_id += 1
 
@@ -4213,7 +4353,7 @@ class DeepSpeedEngine(Module):
                     continue
                 prefix = entry.get('expert_key_prefix')
                 if prefix:
-                    names.update(f"{prefix}.{wname}" for wname in ('w1', 'w2', 'w3'))
+                    names.update(f"{prefix}.{name}" for name in autoep_expert_parameter_names(entry))
 
         if names:
             return names
@@ -4229,7 +4369,8 @@ class DeepSpeedEngine(Module):
             if not isinstance(module, _AutoEPMoELayer):
                 continue
             module_prefix = f"{module_name}." if module_name else ""
-            names.update(f"{module_prefix}experts.{wname}" for wname in ('w1', 'w2', 'w3'))
+            names.update(f"{module_prefix}experts.{name}"
+                         for name, _ in module.experts.named_parameters(recurse=False))
         return names
 
     def _load_checkpoint(self,
@@ -4672,7 +4813,7 @@ class DeepSpeedEngine(Module):
     def _get_non_moe_state_dict(self, full_state_dict):
         """Remove expert-param keys from state dict, keeping all non-expert params.
 
-        Handles both native MoE (deepspeed_moe.experts.*) and AutoEP (experts.w1/w2/w3).
+        Handles native MoE and backend-specific direct AutoEP expert parameters.
         Preserves: router weights, shared_experts, any legacy/manually-built
         expert_bias keys, all non-MoE params.
         """
@@ -4691,10 +4832,11 @@ class DeepSpeedEngine(Module):
                     if key.startswith(module_prefix) and 'expert' in key and 'moe.gate.wg.weight' not in key:
                         expert_param_keys.add(key)
             elif _AutoEPMoELayer is not None and isinstance(module, _AutoEPMoELayer):
-                # AutoEP: remove only the fused expert weight keys (w1, w2, w3)
+                # AutoEP expert backends expose their expert-axis parameters directly.
                 experts_prefix = f"{module_prefix}experts."
+                expert_parameter_names = set(dict(module.experts.named_parameters(recurse=False)))
                 for key in full_state_dict.keys():
-                    if key.startswith(experts_prefix) and key[len(experts_prefix):] in ('w1', 'w2', 'w3'):
+                    if key.startswith(experts_prefix) and key[len(experts_prefix):] in expert_parameter_names:
                         expert_param_keys.add(key)
 
         for key in expert_param_keys:
@@ -4835,10 +4977,12 @@ class DeepSpeedEngine(Module):
                 expp_rank = groups._get_expert_parallel_rank(group_name)
                 exp_dp_rank = groups._get_expert_data_parallel_rank(group_name)
                 module_prefix = f"{n_module}." if n_module else ""
-                expert_params = [getattr(module.experts, wname) for wname in ('w1', 'w2', 'w3')]
+                named_expert_params = list(module.experts.named_parameters(recurse=False))
+                expert_parameter_names = [name for name, _ in named_expert_params]
+                expert_params = [param for _, param in named_expert_params]
                 if self.zero_optimization_partition_weights():
                     frozen_expert_names = [
-                        f"{module_prefix}experts.{wname}" for wname, param in zip(('w1', 'w2', 'w3'), expert_params)
+                        f"{module_prefix}experts.{name}" for name, param in named_expert_params
                         if not param.requires_grad
                     ]
                     if frozen_expert_names:
@@ -4860,6 +5004,8 @@ class DeepSpeedEngine(Module):
                     module.ep_size,
                     'expert_key_prefix':
                     f"{module_prefix}experts",
+                    'expert_parameter_names':
+                    expert_parameter_names,
                     AUTOEP_ZERO3_EXPERT_STATE_FORMAT_KEY:
                     AUTOEP_ZERO3_PARTITIONED_EXPERT_STATE_FORMAT
                     if self.zero_optimization_partition_weights() else 'per_expert_files',
@@ -4896,9 +5042,8 @@ class DeepSpeedEngine(Module):
                         for local_expert_id in range(num_local_experts):
                             global_expert_id = expp_rank * num_local_experts + local_expert_id
                             expert_state_dict = {}
-                            for wname in ('w1', 'w2', 'w3'):
-                                fused_key = f"{module_prefix}experts.{wname}"
-                                param = getattr(module.experts, wname)
+                            for name, param in named_expert_params:
+                                fused_key = f"{module_prefix}experts.{name}"
                                 expert_state_dict[f"{fused_key}.{global_expert_id}"] = (
                                     param[local_expert_id].clone().detach())
                             if folded_autoep_tp:
@@ -4982,7 +5127,14 @@ class DeepSpeedEngine(Module):
             if autoep_layer_info:
                 universal_checkpoint_info.setdefault(UNIVERSAL_CHECKPOINT_VERSION_KEY,
                                                      UNIVERSAL_CHECKPOINT_VERSION_VALUE)
-                universal_checkpoint_info[EXPERT_PARAMETER_PATTERNS] = [r'.*\.experts\.w[123]$']
+                parameter_names = {
+                    name
+                    for entry in autoep_layer_info
+                    for name in autoep_expert_parameter_names(entry)
+                }
+                universal_checkpoint_info[EXPERT_PARAMETER_PATTERNS] = [
+                    rf'.*\.experts\.{re.escape(name)}$' for name in sorted(parameter_names)
+                ]
                 universal_checkpoint_info['ds_autoep_layers'] = autoep_layer_info
 
             state = self._common_checkpoint_state(model_state_dict, zero_optimizer_state, save_frozen_param)
@@ -5376,8 +5528,8 @@ class DeepSpeedEngine(Module):
         path = os.path.join(save_dir, save_filename)
 
         if self.zero_optimization_partition_weights():
-            self._raise_if_autoep_zero3_consolidated_export("save_16bit_model")
             if self.zero_gather_16bit_weights_on_model_save():
+                self._raise_if_autoep_zero3_consolidated_export("save_16bit_model")
                 # consolidation is expensive in time and memory and therefore isn't a default
                 state_dict = self._zero3_consolidated_16bit_state_dict(
                     exclude_frozen_parameters=exclude_frozen_parameters)

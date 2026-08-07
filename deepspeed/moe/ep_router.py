@@ -24,6 +24,11 @@ import torch.nn.functional as F
 from deepspeed.moe.ep_count import count_tokens_per_expert
 
 
+def _requires_stable_topk(scores: torch.Tensor) -> bool:
+    torch_version = torch.__version__.split("+", maxsplit=1)[0]
+    return scores.device.type == "musa" and torch_version.startswith("2.7.")
+
+
 class TokenChoiceTopKRouter(nn.Module):
     """Token-choice top-K routing for Mixture of Experts.
 
@@ -171,8 +176,13 @@ class TokenChoiceTopKRouter(nn.Module):
         if self.num_expert_groups is not None:
             scores_for_choice = self._get_node_limited_routing_scores(scores_for_choice)
 
-        # Select top-k experts per token
-        _, selected_experts_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)
+        if _requires_stable_topk(scores_for_choice):
+            # MUSA 2.7.x can return unstable expert indices for equal top-k scores.
+            # Stable sorting prefers the original expert order when scores tie.
+            _, selected_experts_indices = torch.sort(scores_for_choice, dim=-1, descending=True, stable=True)
+            selected_experts_indices = selected_experts_indices[:, :self.top_k].contiguous()
+        else:
+            _, selected_experts_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)
 
         # Gather original (unbiased) scores for selected experts
         top_scores = scores.gather(dim=1, index=selected_experts_indices)
